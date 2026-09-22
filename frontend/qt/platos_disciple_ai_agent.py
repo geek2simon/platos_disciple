@@ -120,8 +120,8 @@ def load_core():
     validate_core()
 
 
-def validate_local_configuration() -> None:
-    """Check Azure values and verify the local PostgreSQL login."""
+def validate_azure_configuration() -> None:
+    """Check the required Azure OpenAI configuration values."""
     values = [
         str(getattr(core, name, "") or "").strip()
         for name in ("ENDPOINT_URL", "API_KEY", "DEPLOYMENT_NAME")
@@ -134,6 +134,9 @@ def validate_local_configuration() -> None:
     ):
         raise RuntimeError("Azure OpenAI configuration is invalid")
 
+
+def validate_postgresql_connection() -> None:
+    """Verify the local PostgreSQL login with a short timeout."""
     db_config = dict(core.DB_CONFIG)
     db_config.setdefault("connect_timeout", 5)
     with core.psycopg.connect(**db_config):
@@ -600,6 +603,45 @@ class WorkerSignals(QObject):
     finished = Signal()
 
 
+class StartupSignals(QObject):
+    progress = Signal(str)
+    ready = Signal()
+    error = Signal(object)
+
+
+class StartupWorker(QRunnable):
+    """Load and validate the core without blocking the Qt event loop."""
+
+    def __init__(self):
+        super().__init__()
+        self.signals = StartupSignals()
+
+    def run(self):
+        try:
+            self.signals.progress.emit("Checking local configuration...")
+            if not CONFIG_FILE.exists():
+                raise FileNotFoundError(
+                    "The required configuration file was not found:\n"
+                    f"    {CONFIG_FILE}\n\n"
+                    "Please create config/config_general.py with your legitimate "
+                    "local PostgreSQL kb_agent credentials and your own legitimate "
+                    "Azure OpenAI API URL, key, and deployment name."
+                )
+
+            self.signals.progress.emit("Loading Plato's Disciple core module...")
+            load_core()
+
+            self.signals.progress.emit("Validating Azure OpenAI configuration...")
+            validate_azure_configuration()
+
+            self.signals.progress.emit("Connecting to PostgreSQL knowledge base...")
+            validate_postgresql_connection()
+
+            self.signals.ready.emit()
+        except Exception as exc:
+            self.signals.error.emit(exc)
+
+
 class CoreWorker(QRunnable):
     def __init__(self, question: str, prefix: str):
         super().__init__()
@@ -625,6 +667,9 @@ class PlatosDiscipleMainWindow(QMainWindow):
         super().__init__()
         self.pool = QThreadPool.globalInstance()
         self.busy = False
+        self.initialized = False
+        self.startup_worker = None
+        self.current_startup_step = "Initializing Plato's Disciple..."
         self.thinking_seconds = 0
         self.thinking_phase = 0
         self.current_classic_query = ""
@@ -643,51 +688,90 @@ class PlatosDiscipleMainWindow(QMainWindow):
         self.thinking_timer.timeout.connect(self._tick_thinking)
 
         self._build_ui()
-        QTimer.singleShot(0, self._startup_check)
+        self._set_conversation_enabled(False)
+        self._show_initializing_message()
+        QTimer.singleShot(50, self._startup_check)
 
-    def _show_startup_message(self, title: str, message: str):
-        safe_title = html.escape(title)
-        safe_message = html.escape(message).replace("\n", "<br>")
+    def _show_initializing_message(self):
+        self._set_startup_status(self.current_startup_step)
+
+    def _set_startup_status(
+        self,
+        message: str,
+        ready: bool = False,
+        error_text: str = "",
+    ):
+        color = "#287a3f" if ready else "#46515e"
+        error_html = ""
+        if error_text:
+            error_html = (
+                " <span style='color:#c62828;font-weight:700;'>"
+                f"(error: {html.escape(error_text)})"
+                "</span>"
+            )
         self.rag_browser.setHtml(
-            "<div style='margin:8px;padding:12px;border:1px solid #c94b4b;"
-            "border-radius:6px;background:#fbfbfc;'>"
-            f"<div style='font-size:15px;font-weight:700;margin-bottom:8px;'>{safe_title}</div>"
-            f"<div style='font-size:13px;line-height:1.5;'>{safe_message}</div>"
+            "<div style='margin:12px;font-size:13px;"
+            f"font-weight:700;color:{color};'>"
+            f"{html.escape(message)}"
+            f"{error_html}"
             "</div>"
         )
 
-    def _set_application_enabled(self, enabled: bool):
-        self.tabs.setEnabled(enabled)
+    def _append_startup_progress(self, message: str):
+        self.current_startup_step = message
+        self.status_label.setText(message)
+        self._set_startup_status(message)
+
+    def _set_conversation_enabled(self, enabled: bool):
+        """Enable only interactive conversation controls; keep status visible."""
+        self.rag_input.setEnabled(enabled)
+        self.rag_send.setEnabled(enabled)
+        self.rag_clear.setEnabled(enabled)
+        self.classic_input.setEnabled(enabled)
+        self.classic_send.setEnabled(enabled)
+        self.classic_clear.setEnabled(enabled)
+
+        for radio in self.rag_radios.values():
+            radio.setEnabled(enabled)
+        for radio in self.classic_radios.values():
+            radio.setEnabled(enabled)
 
     def _startup_check(self):
-        # Require the user's real local config file.
-        if not CONFIG_FILE.exists():
-            self._set_application_enabled(False)
-            self._show_startup_message(
-                "Configuration Required",
-                "The required configuration file was not found:\n"
-                f"    {CONFIG_FILE}\n\n"
-                "Please create config/config_general.py with your legitimate local "
-                "PostgreSQL kb_agent credentials and your own legitimate Azure "
-                "OpenAI API URL, key, and deployment name.",
-            )
-            self.status_label.setText("Configuration required")
-            return
+        self.startup_worker = StartupWorker()
+        self.startup_worker.signals.progress.connect(self._append_startup_progress)
+        self.startup_worker.signals.ready.connect(self._startup_ready)
+        self.startup_worker.signals.error.connect(self._startup_failed)
+        self.pool.start(self.startup_worker)
 
-        # Config exists. Load the core, validate Azure values, and test the local
-        # PostgreSQL credentials before enabling the application.
-        try:
-            load_core()
-            validate_local_configuration()
-        except Exception as exc:
-            self._set_application_enabled(False)
-            title, message = friendly_error(exc)
-            self._show_startup_message(title, message)
-            self.status_label.setText("Startup error")
-            return
-
-        self._set_application_enabled(True)
+    def _startup_ready(self):
+        self.initialized = True
+        self._set_conversation_enabled(True)
+        self._set_startup_status(
+            "Ready — You can now start a conversation.",
+            ready=True,
+        )
         self.status_label.setText(READY_TEXT)
+        self.rag_input.setFocus()
+        self.startup_worker = None
+
+    def _startup_failed(self, exc):
+        self.initialized = False
+        self._set_conversation_enabled(False)
+
+        if isinstance(exc, FileNotFoundError):
+            error_text = f"configuration file not found: {CONFIG_FILE}"
+            status = "Configuration required"
+        else:
+            detail = str(exc or "Unknown error").strip().splitlines()[-1]
+            error_text = detail
+            status = "Startup error"
+
+        self._set_startup_status(
+            self.current_startup_step,
+            error_text=error_text,
+        )
+        self.status_label.setText(status)
+        self.startup_worker = None
 
     def _build_ui(self):
         root = QWidget()
@@ -868,7 +952,7 @@ class PlatosDiscipleMainWindow(QMainWindow):
         )
 
     def submit_rag(self):
-        if self.busy:
+        if not self.initialized or self.busy:
             return
 
         question = self.rag_input.text().strip()
@@ -937,7 +1021,7 @@ class PlatosDiscipleMainWindow(QMainWindow):
         bar.setValue(bar.maximum())
 
     def submit_classic(self):
-        if self.busy:
+        if not self.initialized or self.busy:
             return
 
         question = self.classic_input.text().strip()
