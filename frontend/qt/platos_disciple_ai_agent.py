@@ -5,6 +5,8 @@ Qt GUI thin shell over core/platos_disciple_core.py
 
 Expected layout:
 <project root>/
+    _assets/
+        platos_disciple_icon_256.png
     core/
         platos_disciple_core.py
     frontend/
@@ -27,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFont
+from PySide6.QtGui import QDesktopServices, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -52,6 +54,9 @@ from PySide6.QtWidgets import (
 
 APP_TITLE = "Plato's Disciple"
 HEADER_LABEL = "Plato's Disciple"
+
+ASSETS_FOLDER_NAME = "_assets"
+APP_ICON_NAME = "platos_disciple_icon_256.png"
 
 WINDOW_X = 80
 WINDOW_Y = 80
@@ -82,6 +87,8 @@ FRONTEND_DIR = GUI_DIR.parent
 APP_ROOT = FRONTEND_DIR.parent
 CORE_DIR = APP_ROOT / CORE_FOLDER_NAME
 CORE_FILE = CORE_DIR / f"{CORE_MODULE_NAME}.py"
+ASSETS_DIR = APP_ROOT / ASSETS_FOLDER_NAME
+APP_ICON_FILE = ASSETS_DIR / APP_ICON_NAME
 
 if not CORE_DIR.exists():
     raise RuntimeError(
@@ -1129,6 +1136,9 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     app.setStyleSheet(APP_STYLE)
+
+    if APP_ICON_FILE.is_file():
+        app.setWindowIcon(QIcon(str(APP_ICON_FILE)))
 
     font = QFont()
     font.setPointSize(9)
