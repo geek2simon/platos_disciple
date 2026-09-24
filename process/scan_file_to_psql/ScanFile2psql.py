@@ -814,14 +814,15 @@ def main():
             folder_path = str(p.parent)
             stat = p.stat()
 
-            # Identify an existing file only by its full path.
-            # If the stored modified timestamp matches the current file timestamp,
-            # the file is treated as unchanged and skipped immediately.
+            # Identify an existing file by its full path. A matching modified
+            # timestamp is only safe to skip when the previous scan completed
+            # successfully. Files left as Processing, Failed, or NULL are retried.
             cur.execute("""
                 SELECT
                     DocID,
                     ModifiedTime,
-                    Metadata
+                    Metadata,
+                    ParseStatus
                 FROM Document
                 WHERE FullPath = %s
                 LIMIT 1
@@ -838,16 +839,21 @@ def main():
                 existing_doc_id = existing[0]
                 existing_modified = existing[1]
                 existing_metadata = existing[2]
+                existing_parse_status = existing[3]
 
-                # MySQL DATETIME commonly stores whole seconds, while Windows may
-                # expose fractional seconds. A difference below one second is
-                # therefore considered the same timestamp.
+                # Database timestamps may be stored at lower precision than the
+                # Windows filesystem timestamp. Treat a sub-second difference as
+                # the same modification time.
                 same_modified = (
                     existing_modified is not None
                     and abs((existing_modified - current_modified).total_seconds()) < 1
                 )
 
-                if same_modified:
+                previous_scan_succeeded = (
+                    str(existing_parse_status or "").strip().lower() == "success"
+                )
+
+                if same_modified and previous_scan_succeeded:
                     # Even if the entity file itself did not change, its
                     # XXXX.meta.json may have been added/changed since the last scan.
                     if existing_metadata != sidecar_metadata:
@@ -869,8 +875,9 @@ def main():
             if existing:
                 doc_id = existing_doc_id
 
-                # Existing path with a different modified timestamp: delete the old
-                # extracted content, then append a fresh extraction for the same DocID.
+                # Reprocess an existing path when the file changed or its previous
+                # scan did not finish successfully. Clear any partial/old extracted
+                # content, then write a fresh extraction under the same DocID.
                 cur.execute("DELETE FROM DocumentChunk WHERE DocID = %s", (doc_id,))
                 cur.execute("DELETE FROM DocumentPageText WHERE DocID = %s", (doc_id,))
                 cur.execute("DELETE FROM DocumentSheetText WHERE DocID = %s", (doc_id,))
