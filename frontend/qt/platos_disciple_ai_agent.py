@@ -189,46 +189,72 @@ def friendly_error(error) -> tuple[str, str]:
 # ============================================================
 
 APP_STYLE = """
-QMainWindow { background: #f3f5f7; }
+QMainWindow { background: #eef2f6; }
 QFrame#MainCard {
     background: white;
-    border: 1px solid #d9dde3;
+    border: 1px solid #cbd5e1;
     border-radius: 10px;
 }
 QLabel#Header {
     font-size: 20px;
     font-weight: 700;
+    color: #172033;
     padding: 4px 2px 8px 2px;
 }
 QLabel#SectionLabel {
     font-size: 12px;
     font-weight: 600;
+    color: #334155;
 }
 QTabWidget::pane {
-    border: 1px solid #d9dde3;
+    border: 1px solid #cbd5e1;
     border-radius: 6px;
     background: white;
 }
-QTabBar::tab { padding: 8px 16px; }
+QTabBar::tab {
+    padding: 8px 16px;
+    color: #475569;
+    background: #f1f5f9;
+    border: 1px solid #cbd5e1;
+    border-bottom: none;
+}
+QTabBar::tab:selected {
+    color: #1d4ed8;
+    background: white;
+    font-weight: 600;
+    border-top: 2px solid #2563eb;
+}
 QTextBrowser {
-    border: 1px solid #d9dde3;
+    border: 1px solid #22a06b;
     border-radius: 6px;
-    background: #fbfbfc;
+    background: #f8fafc;
+    color: #1e293b;
     padding: 6px;
 }
 QLineEdit {
-    border: 1px solid #cfd4dc;
+    border: 1px solid #2563eb;
     border-radius: 6px;
     padding: 9px;
     background: white;
+    color: #172033;
 }
 QPushButton {
-    border: 1px solid #c8cdd5;
+    border: 1px solid #b8c3d1;
     border-radius: 6px;
     padding: 8px 14px;
-    background: #f6f7f9;
+    background: #f8fafc;
+    color: #334155;
 }
-QPushButton:hover { background: #eceff3; }
+QPushButton:hover { background: #e8eef5; }
+QPushButton:pressed { background: #dbe4ee; }
+QPushButton#PrimaryButton {
+    color: white;
+    background: #2563eb;
+    border-color: #2563eb;
+    font-weight: 600;
+}
+QPushButton#PrimaryButton:hover { background: #1d4ed8; }
+QPushButton#PrimaryButton:pressed { background: #1e40af; }
 QPushButton:disabled { color: #9aa0a8; }
 QRadioButton { padding: 2px 5px 2px 0px; }
 """
@@ -852,6 +878,7 @@ class PlatosDiscipleMainWindow(QMainWindow):
         row.addWidget(self.rag_input, 1)
 
         self.rag_send = QPushButton("Ask")
+        self.rag_send.setObjectName("PrimaryButton")
         self.rag_send.clicked.connect(self.submit_rag)
         row.addWidget(self.rag_send)
 
@@ -901,6 +928,7 @@ class PlatosDiscipleMainWindow(QMainWindow):
         row.addWidget(self.classic_input, 1)
 
         self.classic_send = QPushButton("Search")
+        self.classic_send.setObjectName("PrimaryButton")
         self.classic_send.clicked.connect(self.submit_classic)
         row.addWidget(self.classic_send)
 
