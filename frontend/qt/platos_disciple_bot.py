@@ -52,7 +52,7 @@ from PySide6.QtWidgets import (
 # CONFIG
 # ============================================================
 
-APP_TITLE = "Plato's Disciple"
+APP_TITLE = "Plato's Disciple - Local Knowledge Bot"
 HEADER_LABEL = "Plato's Disciple"
 
 ASSETS_FOLDER_NAME = "_assets"

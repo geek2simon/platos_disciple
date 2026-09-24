@@ -4,16 +4,18 @@
 
 # Plato's Disciple
 
-Plato's Disciple is a local-first desktop application for building, searching, and chatting with a private document knowledge base. Documents are stored in PostgreSQL, while Azure OpenAI provides query routing and retrieval-augmented answers.
+Plato's Disciple is a local-first desktop agent for searching and chatting with a private document knowledge base. It carries forward the proven model of traditional full-text search—indexing the contents of local documents (XLSX, DOCX, PDF, PPT/PPTX, HTML, and more)—while bringing a Google-like search experience to your own document collection.
+
+Use it in two complementary ways: **Classic Search** provides fast full-text keyword results with highlighted excerpts, while **AI Conversation** uses Azure OpenAI and retrieval-augmented generation (RAG) to let you ask questions about your documents in natural language—much like using ChatGPT—and receive grounded answers in the language of your choice. Your source documents, search index, and PostgreSQL database remain locally stored and under your control; only your question and the selected document context required for AI processing are sent to your configured Azure OpenAI service.
 
 ## Features
 
-- Local document ingestion and PostgreSQL storage
-- AI conversation with scoped retrieval-augmented generation (RAG)
-- Classic keyword search with highlighted document excerpts
+- Local document ingestion and local PostgreSQL storage
+- ChatGPT-like conversations grounded in your private documents through scoped retrieval-augmented generation (RAG)
+- Google-like full-text keyword search with highlighted document excerpts
 - Incremental scanning: unchanged files are skipped and modified files are re-indexed
 - Support for PDF, Word, Excel, PowerPoint, text, CSV, HTML, and MHTML files
-- Optional SEC EDGAR filing downloader with sidecar metadata
+- Sample documents and database built from official U.S. financial-market sources that are freely available to the public—including SEC EDGAR filings (10-K, 10-Q, 8-K, and more) and Federal Reserve publications—with an SEC downloader and sidecar metadata
 - Execution and processing logs stored in the database
 
 ## Requirements
