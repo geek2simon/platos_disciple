@@ -891,7 +891,7 @@ def resolve_folder_level1(conn, text):
             return category
 
     # Then resolve category names embedded in natural-language questions,
-    # e.g. "2025 projects里面有什么文件，给个列表".
+    # e.g. "What files are in the 2025 projects? Give me a list."
     for row in rows:
         category = str(row.get("FolderLevel1") or "").strip()
         if category and category.lower() in q:
@@ -1481,6 +1481,10 @@ Common metadata keys include:
 - sector
 - country
 
+The Document table also has a real column named CreatedAt.
+CreatedAt means when the document record was added to this local knowledge base.
+This is different from filing_date, which is the business/document date inside metadata.
+
 Separate STRUCTURED SCOPE from SEMANTIC CONTENT.
 
 Example:
@@ -1506,12 +1510,18 @@ Rules:
 3. SOFT when a useful scope exists but is incomplete, inferred, or ambiguous.
 4. GLOBAL when the question intentionally spans the KB or has no useful scope.
 5. You may normalize a well-known company name to ticker only when highly confident.
-6. semantic_query should describe what to find INSIDE the scoped documents.
-7. Remove metadata-only terms such as ticker/year/form type from semantic_query when possible.
-8. date_from/date_to must be YYYY-MM-DD or null.
-9. Scope values other than dates must be arrays.
-10. Use only: ticker, fact_type, form_type, source, sector, country, date_from, date_to.
-11. Do not answer the question.
+6. semantic_query should describe what CONTENT/TOPIC to find INSIDE the scoped documents.
+7. If the user only asks for an operation such as summary, key points, highlights, overview, summarize, 要点, 总结, 概括, 展示要点, and does not specify a content topic, semantic_query MUST be an empty string. Task words are not retrieval keywords.
+8. Remove metadata-only terms such as ticker/year/form type from semantic_query when possible.
+9. date_from/date_to refer to the document/business date such as filing_date.
+10. created_from/created_to refer to Document.CreatedAt, meaning when the file was added/indexed/scanned into this KB.
+11. For phrases such as today, yesterday, this week, recently added, newly added, scanned today, indexed today, or 今天新增/今天添加/今天scan/今天入库, use created_from/created_to rather than date_from/date_to.
+12. All date fields must be YYYY-MM-DD or null.
+13. Scope values other than dates must be arrays.
+14. Use only: ticker, fact_type, form_type, source, sector, country, date_from, date_to, created_from, created_to.
+15. Do not answer the question.
+
+Current local date: {datetime.now().date().isoformat()}
 
 Return:
 {{
@@ -1524,7 +1534,9 @@ Return:
     "sector": [],
     "country": [],
     "date_from": null,
-    "date_to": null
+    "date_to": null,
+    "created_from": null,
+    "created_to": null
   }},
   "semantic_query": "...",
   "explicit_constraints": [],
@@ -1555,6 +1567,8 @@ Current thread summary:
                 "country": [],
                 "date_from": None,
                 "date_to": None,
+                "created_from": None,
+                "created_to": None,
             },
             "semantic_query": user_question,
             "explicit_constraints": [],
@@ -1567,7 +1581,7 @@ Current thread summary:
     for key in SUPPORTED_SCOPE_KEYS:
         scope[key] = _clean_scope_list(raw_scope.get(key))
 
-    for key in ("date_from", "date_to"):
+    for key in ("date_from", "date_to", "created_from", "created_to"):
         value = raw_scope.get(key)
         scope[key] = str(value).strip() if value else None
 
@@ -1575,7 +1589,7 @@ Current thread summary:
     if recommended not in {"HARD", "SOFT", "GLOBAL"}:
         recommended = "GLOBAL"
 
-    semantic_query = str(data.get("semantic_query") or "").strip() or user_question
+    semantic_query = str(data.get("semantic_query") or "").strip()
 
     return {
         "recommended_mode": recommended,
@@ -1592,6 +1606,8 @@ def _scope_has_constraints(scope):
         any(scope.get(k) for k in SUPPORTED_SCOPE_KEYS)
         or bool(scope.get("date_from"))
         or bool(scope.get("date_to"))
+        or bool(scope.get("created_from"))
+        or bool(scope.get("created_to"))
     )
 
 
@@ -1673,6 +1689,33 @@ def _build_scope_sql(scope, mode):
                 f"(CASE WHEN {date_expr} <= %s::date THEN 3.0000 ELSE 0 END)"
             )
             soft_score_params.append(date_to)
+
+    # Knowledge-base ingestion date. Document.CreatedAt records when the document
+    # was first added to this KB; do not confuse it with metadata filing_date.
+    created_from = scope.get("created_from")
+    created_to = scope.get("created_to")
+
+    if created_from:
+        if mode == "HARD":
+            hard_parts.append("d.CreatedAt >= %s::date")
+            hard_params.append(created_from)
+        elif mode == "SOFT":
+            soft_score_parts.append(
+                "(CASE WHEN d.CreatedAt >= %s::date THEN 4.0000 ELSE 0 END)"
+            )
+            soft_score_params.append(created_from)
+
+    if created_to:
+        # Use an exclusive next-day boundary so the entire calendar day is included
+        # regardless of the time component stored in CreatedAt.
+        if mode == "HARD":
+            hard_parts.append("d.CreatedAt < (%s::date + INTERVAL '1 day')")
+            hard_params.append(created_to)
+        elif mode == "SOFT":
+            soft_score_parts.append(
+                "(CASE WHEN d.CreatedAt < (%s::date + INTERVAL '1 day') THEN 4.0000 ELSE 0 END)"
+            )
+            soft_score_params.append(created_to)
 
     hard_sql = " AND ".join(hard_parts) if hard_parts else "TRUE"
     soft_score_sql = (
@@ -1985,23 +2028,93 @@ def group_chunks_to_docs(chunks, doc_limit=50, score_top_n=3):
     return result[:doc_limit]
 
 
+def extract_explicit_semantic_override(user_question):
+    """
+    <concept> is a power-user override for semantic content retrieval.
+
+    Returns:
+      cleaned_question: question with the first <...> removed
+      has_override:     True when angle brackets were explicitly supplied
+      concept:          text inside <...>; empty string means force no semantic filtering
+    """
+    text = str(user_question or "")
+    match = re.search(r"<([^<>]*)>", text)
+    if not match:
+        return text, False, None
+
+    concept = match.group(1).strip()
+    cleaned = (text[:match.start()] + " " + text[match.end():]).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned, True, concept
+
+
+def get_scoped_chunks(conn, scope, limit=500, max_chars=3000):
+    """Directly load chunks from a HARD metadata scope without semantic keyword filtering."""
+    hard_scope_sql, hard_scope_params, _, _ = _build_scope_sql(scope or {}, "HARD")
+    sql = f"""
+    SELECT
+        c.ChunkID,
+        d.DocID,
+        d.FileName,
+        d.FullPath,
+        d.Extension,
+        d.FolderLevel1,
+        d.FolderLevel2,
+        d.FolderLevel3,
+        c.ChunkNo,
+        c.ChunkSource,
+        c.PageNo,
+        c.SheetName,
+        LEFT(c.ChunkText, %s) AS TextSample,
+        1.0 AS Score
+    FROM DocumentChunk c
+    JOIN Document d ON c.DocID = d.DocID
+    WHERE {hard_scope_sql}
+    ORDER BY d.DocID, c.ChunkNo, c.ChunkID
+    LIMIT %s;
+    """
+    params = [max_chars]
+    params.extend(hard_scope_params)
+    params.append(limit)
+    return execute_select(conn, sql, tuple(params), trace_name="DirectScopedChunks_HARD")
+
+
 def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="AUTO"):
     if THREAD["docs"] and not force_new_search:
         return THREAD["docs"], THREAD["last_search_query"], False, THREAD.get("retrieval_stats", {})
 
-    scope_plan = plan_rag_scope(user_question, requested_mode=rag_scope_mode)
+    planner_question, has_semantic_override, semantic_override = extract_explicit_semantic_override(user_question)
+    scope_plan = plan_rag_scope(planner_question, requested_mode=rag_scope_mode)
     effective_mode = scope_plan["effective_mode"]
     scope = scope_plan["scope"]
 
-    semantic_query = scope_plan.get("semantic_query") or user_question
+    # <...> explicitly controls the semantic content concept.
+    # <tariff> -> OpenAI expands/translates the concept into retrieval terms.
+    # <>     -> explicitly disables semantic keyword filtering.
+    if has_semantic_override:
+        if semantic_override:
+            rewritten = rewrite_search_query(semantic_override)
+            search_query = (rewritten.get("search_query") or semantic_override).strip()
+        else:
+            search_query = ""
+    else:
+        search_query = (scope_plan.get("semantic_query") or "").strip()
 
     if effective_mode == "GLOBAL":
-        rewritten = rewrite_search_query(semantic_query)
-        search_query = rewritten["search_query"]
-        topic_title = rewritten["topic_title"]
+        # GLOBAL still needs a content query. If the planner returned no topic,
+        # use the natural-language question as the normal global search input.
+        if not search_query:
+            rewritten = rewrite_search_query(planner_question)
+            search_query = rewritten["search_query"]
+            topic_title = rewritten["topic_title"]
+        elif has_semantic_override:
+            topic_title = planner_question[:120] or "Topic"
+        else:
+            rewritten = rewrite_search_query(search_query)
+            search_query = rewritten["search_query"]
+            topic_title = rewritten["topic_title"]
     else:
-        search_query = semantic_query
-        topic_title = user_question[:120] or "Topic"
+        topic_title = planner_question[:120] or "Topic"
 
     top_docs = get_int_setting(conn, "TopKDocuments", 50)
     chunk_limit = max(200, top_docs * 10) if effective_mode == "HARD" else max(500, top_docs * 10)
@@ -2009,19 +2122,43 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
     scoped_documents = count_scoped_documents(conn, scope, effective_mode)
     scoped_chunks = count_scoped_chunks(conn, scope, effective_mode)
 
-    matched_chunks = count_matching_chunks(
-        conn,
-        search_query,
-        scope=scope,
-        scope_mode=effective_mode,
+    direct_scoped_retrieval = (
+        effective_mode == "HARD"
+        and _scope_has_constraints(scope)
+        and not search_query
     )
-    chunks = search_chunks(
-        conn,
-        search_query,
-        limit=chunk_limit,
-        scope=scope,
-        scope_mode=effective_mode,
-    )
+
+    if direct_scoped_retrieval:
+        # No content topic was requested. The metadata scope itself identifies
+        # the documents, so do not search for task words such as summary/key points.
+        # Load scoped chunks directly for GPT summarization/reasoning.
+        direct_limit = max(chunk_limit, min(int(scoped_chunks or 0), 1000))
+        chunks = get_scoped_chunks(conn, scope, limit=direct_limit, max_chars=3000)
+        matched_chunks = len(chunks)
+        context_chunks_per_doc = 20
+        ranking_method = "HARD_METADATA_DIRECT_SCOPED_CHUNKS"
+    else:
+        matched_chunks = count_matching_chunks(
+            conn,
+            search_query,
+            scope=scope,
+            scope_mode=effective_mode,
+        )
+        chunks = search_chunks(
+            conn,
+            search_query,
+            limit=chunk_limit,
+            scope=scope,
+            scope_mode=effective_mode,
+        )
+        context_chunks_per_doc = 3
+        ranking_method = (
+            "HARD_METADATA_FILTER_THEN_TOP_3_CHUNK_AVERAGE"
+            if effective_mode == "HARD"
+            else "SOFT_METADATA_BOOST_PLUS_TOP_3_CHUNK_AVERAGE"
+            if effective_mode == "SOFT"
+            else "GLOBAL_TOP_3_CHUNK_AVERAGE"
+        )
 
     unique_docs_matched = len(set(r["DocID"] for r in chunks))
     docs = group_chunks_to_docs(chunks, doc_limit=top_docs, score_top_n=3)
@@ -2033,7 +2170,10 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
         "RAGScope": scope,
         "RAGScopeExplicitConstraints": scope_plan.get("explicit_constraints"),
         "RAGScopeReason": scope_plan.get("reason"),
+        "SemanticOverridePresent": has_semantic_override,
+        "SemanticOverrideConcept": semantic_override if has_semantic_override else None,
         "SemanticQuery": search_query,
+        "DirectScopedRetrieval": direct_scoped_retrieval,
         "ScopedDocuments": scoped_documents,
         "ScopedChunks": scoped_chunks,
         "MatchedChunks": matched_chunks,
@@ -2042,13 +2182,8 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
         "UniqueDocumentsMatched": unique_docs_matched,
         "TopKDocuments": top_docs,
         "DocumentsSent": len(docs),
-        "DocumentRankingMethod": (
-            "HARD_METADATA_FILTER_THEN_TOP_3_CHUNK_AVERAGE"
-            if effective_mode == "HARD"
-            else "SOFT_METADATA_BOOST_PLUS_TOP_3_CHUNK_AVERAGE"
-            if effective_mode == "SOFT"
-            else "GLOBAL_TOP_3_CHUNK_AVERAGE"
-        ),
+        "ContextChunksPerDoc": context_chunks_per_doc,
+        "DocumentRankingMethod": ranking_method,
     }
 
     THREAD["docs"] = docs
@@ -2149,7 +2284,7 @@ Current user question:
 {user_question}
 
 Retrieved document context:
-{build_docs_context(docs, max_chunks_per_doc=(len(docs[0]["Chunks"]) if len(docs)==1 and THREAD.get("current_document_mode") else 3))}
+{build_docs_context(docs, max_chunks_per_doc=(len(docs[0]["Chunks"]) if len(docs)==1 and THREAD.get("current_document_mode") else int((THREAD.get("retrieval_stats") or {}).get("ContextChunksPerDoc") or 3)))}
 """
 
     result = gpt_call([
@@ -2467,7 +2602,7 @@ def run_metadata(conn, user_question, intent, route):
         print("Presentation: GPT text / markdown\n")
 
         # Sorting-style metadata question:
-        # Do not treat words such as "最新更新" as filename keywords.
+        # Do not treat phrases such as "latest updates" as filename keywords.
         if is_latest_modified_question(user_question):
             rows = get_latest_modified_files(conn, limit=1)
             print_rows(
@@ -2479,7 +2614,7 @@ def run_metadata(conn, user_question, intent, route):
             return True
 
         # Minimal category resolver:
-        # Questions such as "2025 projects里面有什么文件" refer to FolderLevel1,
+        # Questions such as "What files are in the 2025 projects?" refer to FolderLevel1,
         # not to a literal filename phrase such as "files in 2025 projects".
         category = resolve_folder_level1(conn, user_question)
         if not category:
@@ -2631,7 +2766,8 @@ def run_rag(conn, user_question, intent, force_new_search=False, rag_scope_mode=
     print("Semantic search query:", search_query)
     print("New search:", searched)
 
-    chunks_sent_est = sum(min(len(d.get("Chunks", [])), 3) for d in docs)
+    context_chunks_per_doc = int(retrieval_stats.get("ContextChunksPerDoc") or 3)
+    chunks_sent_est = sum(min(len(d.get("Chunks", [])), context_chunks_per_doc) for d in docs)
     print(f"Matched chunks: {retrieval_stats.get('MatchedChunks')}")
     print(f"Chunks retrieved: {retrieval_stats.get('ChunksRetrieved')} / limit {retrieval_stats.get('ChunkLimit')}")
     print(f"Unique documents matched: {retrieval_stats.get('UniqueDocumentsMatched')}")
@@ -2728,7 +2864,7 @@ def read_user_question():
         return "\n".join(lines).strip()
 
     # Optional inline multi-line start:
-    # Ask> <<< 请分析这个topic
+    # Ask> <<< Please analyze this topic
     if first_line.lstrip().startswith("<<<"):
         remainder = first_line.lstrip()[3:].strip()
         print("Multi-line mode. Finish with >>>")
@@ -2946,7 +3082,7 @@ def process_user_question(conn, user_question):
     # Forced route prefix switches
     # -------------------------------------------------
     # Examples:
-    #   RAG: 客户 Example Customer 对包装有哪些特殊要求？
+    #   RAG: What special packaging requirements does Example Customer have?
     #   SEARCH: Example Customer packaging requirements
     #   FILES: Example Customer
     #   CATALOG: Europe
