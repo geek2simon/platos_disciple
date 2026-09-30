@@ -13,9 +13,10 @@ Use it in two complementary ways: **Classic Search** provides fast full-text key
 - Local document ingestion and local PostgreSQL storage
 - ChatGPT-like conversations grounded in your private documents through scoped retrieval-augmented generation (RAG)
 - Google-like full-text keyword search with highlighted document excerpts
+- Custom query hints, such as `<semantic: ...>` and `<file: ...>`, for more precise, scoped searches across the local knowledge base
 - Incremental scanning: unchanged files are skipped and modified files are re-indexed
 - Support for PDF, Word, Excel, PowerPoint, text, CSV, HTML, and MHTML files
-- Sample documents and database built from official U.S. financial-market sources that are freely available to the public—including SEC EDGAR filings (10-K, 10-Q, 8-K, and more) and Federal Reserve publications—with an SEC downloader and sidecar metadata
+- Sample documents and database built from official U.S. financial-market sources that are freely available to the public — including SEC EDGAR filings (10-K, 10-Q, 8-K) — with an SEC downloader and sidecar metadata. Also a FOMC downloader for official Federal Reserve monetary-policy materials, including meeting statements, minutes, press-conference transcripts, Summary of Economic Projections (SEP) materials, and related documents
 - Execution and processing logs stored in the database
 
 ## Requirements
