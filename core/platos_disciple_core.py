@@ -93,6 +93,7 @@ THREAD = {
     "last_rag_scope": {},
     "last_rag_scope_mode": "AUTO",
     "last_semantic_query": "",
+    "last_query_hints": {},
 }
 
 
@@ -238,6 +239,7 @@ def begin_execution(user_question, user_command=None):
         "RowsReturned": None,
         "SearchQuery": None,
         "NewSearch": None,
+        "QueryHints": {},
         "RetrievalStats": {},
         "DocumentsUsed": [],
         "ChunksUsed": [],
@@ -773,77 +775,246 @@ Current thread summary:
 
 
 # =====================================================
+# Generic query hints
+# =====================================================
+
+SUPPORTED_QUERY_HINTS = {"semantic", "ext", "file"}
+
+
+class QueryHintError(ValueError):
+    """Raised when a named <key:value> query hint is invalid."""
+
+
+def empty_query_hints():
+    return {
+        "semantic_present": False,
+        "semantic": None,
+        "ext": [],
+        "file": [],
+    }
+
+
+def _append_unique_case_insensitive(target, values):
+    seen = {str(x).lower() for x in target}
+    for value in values:
+        value = str(value or "").strip()
+        if value and value.lower() not in seen:
+            seen.add(value.lower())
+            target.append(value)
+
+
+def _split_hint_values(value):
+    """Split list-style hint values on English/Chinese commas or semicolons."""
+    return [x.strip() for x in re.split(r"[,，;；]+", str(value or "")) if x.strip()]
+
+
+def parse_query_hints(user_question):
+    """
+    Parse generic angle-bracket hints and remove them from the task question.
+
+    Canonical named hints:
+      <semantic:interest rate risk>  semantic retrieval override
+      <ext:pdf,docx>                 hard file-extension filter
+      <file:fomc,minutes>            hard filename-contains filter
+
+    Backward compatibility:
+      <interest rate risk>           same as <semantic:interest rate risk>
+      <>                             same as <semantic:> (disable semantic match)
+
+    Named hint keys and extensions are case-insensitive. English and Chinese
+    colons/commas are accepted. Multiple ext/file hints are merged; more than
+    one semantic hint is rejected because its meaning would be ambiguous.
+    """
+    original = str(user_question or "")
+    hints = empty_query_hints()
+    semantic_seen = False
+    spans = []
+
+    for match in re.finditer(r"<([^<>]*)>", original):
+        raw = match.group(1).strip()
+        named = re.match(r"^([A-Za-z][A-Za-z0-9_]*)\s*[:：]\s*(.*)$", raw, flags=re.S)
+
+        if named:
+            key = named.group(1).strip().lower()
+            value = named.group(2).strip()
+            if key not in SUPPORTED_QUERY_HINTS:
+                supported = ", ".join(sorted(SUPPORTED_QUERY_HINTS))
+                raise QueryHintError(
+                    f"Unknown hint <{key}:...>. Supported hints: {supported}."
+                )
+        else:
+            # Legacy unnamed <...> always means a semantic override.
+            key = "semantic"
+            value = raw
+
+        if key == "semantic":
+            if semantic_seen:
+                raise QueryHintError(
+                    "Only one semantic hint is allowed. Use either <semantic:...> or one legacy <...> hint."
+                )
+            semantic_seen = True
+            hints["semantic_present"] = True
+            hints["semantic"] = value
+
+        elif key == "ext":
+            values = []
+            for item in _split_hint_values(value):
+                ext = item.lower().lstrip(".").strip()
+                if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,15}", ext):
+                    raise QueryHintError(f"Invalid file extension in <ext:...>: {item}")
+                values.append(ext)
+            if not values:
+                raise QueryHintError("<ext:...> requires at least one extension.")
+            _append_unique_case_insensitive(hints["ext"], values)
+
+        elif key == "file":
+            values = _split_hint_values(value)
+            if not values:
+                raise QueryHintError("<file:...> requires at least one filename term.")
+            _append_unique_case_insensitive(hints["file"], values)
+
+        spans.append(match.span())
+
+    cleaned_parts = []
+    position = 0
+    for start, end in spans:
+        cleaned_parts.append(original[position:start])
+        cleaned_parts.append(" ")
+        position = end
+    cleaned_parts.append(original[position:])
+    cleaned_question = re.sub(r"\s+", " ", "".join(cleaned_parts)).strip()
+
+    return cleaned_question, hints
+
+
+def query_hints_for_log(hints):
+    hints = hints or empty_query_hints()
+    return {
+        "semantic_present": bool(hints.get("semantic_present")),
+        "semantic": hints.get("semantic") if hints.get("semantic_present") else None,
+        "ext": list(hints.get("ext") or []),
+        "file": list(hints.get("file") or []),
+    }
+
+
+def query_hint_signature(hints):
+    return json.dumps(
+        query_hints_for_log(hints),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _build_query_hint_sql(hints, alias="d"):
+    """Build parameterized hard filters for Document.Extension and FileName."""
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", alias):
+        raise ValueError("Invalid SQL alias for query hints.")
+
+    hints = hints or empty_query_hints()
+    parts = []
+    params = []
+
+    extensions = [str(x).lower().lstrip(".") for x in (hints.get("ext") or [])]
+    if extensions:
+        placeholders = ", ".join(["%s"] * len(extensions))
+        parts.append(
+            f"LOWER(LTRIM(COALESCE({alias}.Extension, ''), '.')) IN ({placeholders})"
+        )
+        params.extend(extensions)
+
+    filename_terms = [str(x).strip() for x in (hints.get("file") or []) if str(x).strip()]
+    if filename_terms:
+        filename_parts = [f"{alias}.FileName ILIKE %s" for _ in filename_terms]
+        parts.append("(" + " OR ".join(filename_parts) + ")")
+        params.extend([f"%{x}%" for x in filename_terms])
+
+    return (" AND ".join(parts) if parts else "TRUE"), params
+
+
+# =====================================================
 # Metadata SQL
 # =====================================================
 
-def get_file_count(conn):
-    sql = """
+def get_file_count(conn, hints=None):
+    hint_sql, hint_params = _build_query_hint_sql(hints, alias="d")
+    sql = f"""
     SELECT
         COUNT(*) AS TotalFiles,
-        SUM(CASE WHEN ParseStatus='Success' THEN 1 ELSE 0 END) AS ParsedSuccess,
-        SUM(CASE WHEN ParseStatus='Failed' THEN 1 ELSE 0 END) AS ParsedFailed,
-        SUM(CASE WHEN ParseStatus='Pending' THEN 1 ELSE 0 END) AS Pending,
-        ROUND(SUM(FileSizeBytes)::NUMERIC / 1024 / 1024, 2) AS TotalSizeMB
-    FROM Document;
+        SUM(CASE WHEN d.ParseStatus='Success' THEN 1 ELSE 0 END) AS ParsedSuccess,
+        SUM(CASE WHEN d.ParseStatus='Failed' THEN 1 ELSE 0 END) AS ParsedFailed,
+        SUM(CASE WHEN d.ParseStatus='Pending' THEN 1 ELSE 0 END) AS Pending,
+        ROUND(SUM(d.FileSizeBytes)::NUMERIC / 1024 / 1024, 2) AS TotalSizeMB
+    FROM Document d
+    WHERE {hint_sql};
     """
-    return execute_select(conn, sql, fetch="one", trace_name="FileCount")
+    return execute_select(conn, sql, tuple(hint_params), fetch="one", trace_name="FileCount")
 
 
-def get_type_count(conn):
-    sql = """
+def get_type_count(conn, hints=None):
+    hint_sql, hint_params = _build_query_hint_sql(hints, alias="d")
+    sql = f"""
     SELECT
-        Extension,
-        ParseStatus,
+        d.Extension,
+        d.ParseStatus,
         COUNT(*) AS FileCount,
-        ROUND(SUM(FileSizeBytes)::NUMERIC / 1024 / 1024, 2) AS TotalSizeMB
-    FROM Document
-    GROUP BY Extension, ParseStatus
+        ROUND(SUM(d.FileSizeBytes)::NUMERIC / 1024 / 1024, 2) AS TotalSizeMB
+    FROM Document d
+    WHERE {hint_sql}
+    GROUP BY d.Extension, d.ParseStatus
     ORDER BY FileCount DESC;
     """
-    return execute_select(conn, sql, trace_name="TypeCount")
+    return execute_select(conn, sql, tuple(hint_params), trace_name="TypeCount")
 
 
-def get_folder_catalog(conn, limit=500):
-    sql = """
+def get_folder_catalog(conn, limit=500, hints=None):
+    hint_sql, hint_params = _build_query_hint_sql(hints, alias="d")
+    sql = f"""
     SELECT
-        FolderLevel1,
-        FolderLevel2,
-        FolderLevel3,
-        Extension,
+        d.FolderLevel1,
+        d.FolderLevel2,
+        d.FolderLevel3,
+        d.Extension,
         COUNT(*) AS FileCount
-    FROM Document
-    GROUP BY FolderLevel1, FolderLevel2, FolderLevel3, Extension
-    ORDER BY FolderLevel1, FolderLevel2, FolderLevel3, FileCount DESC
+    FROM Document d
+    WHERE {hint_sql}
+    GROUP BY d.FolderLevel1, d.FolderLevel2, d.FolderLevel3, d.Extension
+    ORDER BY d.FolderLevel1, d.FolderLevel2, d.FolderLevel3, FileCount DESC
     LIMIT %s;
     """
-    return execute_select(conn, sql, (limit,), trace_name="FolderCatalog")
+    return execute_select(conn, sql, tuple(hint_params + [limit]), trace_name="FolderCatalog")
 
 
-def list_files(conn, keyword=None, limit=500):
+def list_files(conn, keyword=None, limit=500, hints=None):
     params = []
-    where = ""
+    where_parts = []
 
     if keyword:
-        where = """
-        WHERE FileName ILIKE %s
-           OR FullPath ILIKE %s
-           OR FolderPath ILIKE %s
-           OR Extension ILIKE %s
-        """
+        where_parts.append(
+            "(d.FileName ILIKE %s OR d.FullPath ILIKE %s "
+            "OR d.FolderPath ILIKE %s OR d.Extension ILIKE %s)"
+        )
         like = f"%{keyword}%"
         params = [like, like, like, like]
 
+    hint_sql, hint_params = _build_query_hint_sql(hints, alias="d")
+    if hint_sql != "TRUE":
+        where_parts.append(f"({hint_sql})")
+        params.extend(hint_params)
+
+    where = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+
     sql = f"""
     SELECT
-        DocID,
-        FileName,
-        Extension,
-        FullPath,
-        ModifiedTime,
-        ParseStatus
-    FROM Document
+        d.DocID,
+        d.FileName,
+        d.Extension,
+        d.FullPath,
+        d.ModifiedTime,
+        d.ParseStatus
+    FROM Document d
     {where}
-    ORDER BY FullPath
+    ORDER BY d.FullPath
     LIMIT %s;
     """
 
@@ -906,29 +1077,31 @@ def resolve_folder_level1(conn, text):
     return None
 
 
-def list_files_by_folder_level1(conn, folder_level1, limit=500):
+def list_files_by_folder_level1(conn, folder_level1, limit=500, hints=None):
     """List files in one resolved top-level category."""
-    sql = """
+    hint_sql, hint_params = _build_query_hint_sql(hints, alias="d")
+    sql = f"""
     SELECT
-        DocID,
-        FileName,
-        Extension,
-        FullPath,
-        ModifiedTime,
-        ParseStatus
-    FROM Document
-    WHERE FolderLevel1 = %s
-    ORDER BY FullPath
+        d.DocID,
+        d.FileName,
+        d.Extension,
+        d.FullPath,
+        d.ModifiedTime,
+        d.ParseStatus
+    FROM Document d
+    WHERE d.FolderLevel1 = %s
+      AND ({hint_sql})
+    ORDER BY d.FullPath
     LIMIT %s;
     """
     return execute_select(
         conn,
         sql,
-        (folder_level1, limit),
+        tuple([folder_level1] + hint_params + [limit]),
         trace_name="FileListByFolderLevel1"
     )
 
-def get_latest_modified_files(conn, limit=1):
+def get_latest_modified_files(conn, limit=1, hints=None):
     """
     Return the most recently modified files based on Document.ModifiedTime.
 
@@ -940,24 +1113,26 @@ def get_latest_modified_files(conn, limit=1):
     The SQL is executed through execute_select(), so it is automatically
     captured in AgentExecutionLog.GeneratedSQL / SQLTraceJSON.
     """
-    sql = """
+    hint_sql, hint_params = _build_query_hint_sql(hints, alias="d")
+    sql = f"""
     SELECT
-        DocID,
-        FileName,
-        Extension,
-        FullPath,
-        ModifiedTime,
-        ParseStatus
-    FROM Document
-    WHERE ModifiedTime IS NOT NULL
-    ORDER BY ModifiedTime DESC, DocID DESC
+        d.DocID,
+        d.FileName,
+        d.Extension,
+        d.FullPath,
+        d.ModifiedTime,
+        d.ParseStatus
+    FROM Document d
+    WHERE d.ModifiedTime IS NOT NULL
+      AND ({hint_sql})
+    ORDER BY d.ModifiedTime DESC, d.DocID DESC
     LIMIT %s;
     """
 
     return execute_select(
         conn,
         sql,
-        (limit,),
+        tuple(hint_params + [limit]),
         trace_name="LatestModifiedFiles"
     )
 
@@ -988,25 +1163,32 @@ def is_latest_modified_question(user_question):
     return any(phrase in q for phrase in phrases)
 
 
-def browse_summaries(conn, keyword=None, limit=100):
+def browse_summaries(conn, keyword=None, limit=100, hints=None):
     params = []
-    where = ""
+    where_parts = []
 
     if keyword:
-        where = """
-        WHERE d.FileName ILIKE %s
-           OR d.FullPath ILIKE %s
-           OR s.Title ILIKE %s
-           OR s.DocType ILIKE %s
-           OR s.Summary ILIKE %s
-           OR s.Keywords ILIKE %s
-           OR s.Topics ILIKE %s
-           OR s.Companies ILIKE %s
-           OR s.Products ILIKE %s
-           OR s.Countries ILIKE %s
-        """
+        where_parts.append("""
+        (d.FileName ILIKE %s
+         OR d.FullPath ILIKE %s
+         OR s.Title ILIKE %s
+         OR s.DocType ILIKE %s
+         OR s.Summary ILIKE %s
+         OR s.Keywords ILIKE %s
+         OR s.Topics ILIKE %s
+         OR s.Companies ILIKE %s
+         OR s.Products ILIKE %s
+         OR s.Countries ILIKE %s)
+        """)
         like = f"%{keyword}%"
         params = [like] * 10
+
+    hint_sql, hint_params = _build_query_hint_sql(hints, alias="d")
+    if hint_sql != "TRUE":
+        where_parts.append(f"({hint_sql})")
+        params.extend(hint_params)
+
+    where = "WHERE " + " AND ".join(where_parts) if where_parts else ""
 
     sql = f"""
     SELECT
@@ -1038,43 +1220,46 @@ def browse_summaries(conn, keyword=None, limit=100):
 
 
 
-def get_category_stats(conn, level=1, limit=100):
+def get_category_stats(conn, level=1, limit=100, hints=None):
     """Return compact folder/category statistics. This is safe to send to GPT."""
     if level == 3:
-        select_cols = "FolderLevel1, FolderLevel2, FolderLevel3"
-        group_cols = "FolderLevel1, FolderLevel2, FolderLevel3"
-        order_cols = "FileCount DESC, FolderLevel1, FolderLevel2, FolderLevel3"
+        select_cols = "d.FolderLevel1, d.FolderLevel2, d.FolderLevel3"
+        group_cols = "d.FolderLevel1, d.FolderLevel2, d.FolderLevel3"
+        order_cols = "FileCount DESC, d.FolderLevel1, d.FolderLevel2, d.FolderLevel3"
     elif level == 2:
-        select_cols = "FolderLevel1, FolderLevel2"
-        group_cols = "FolderLevel1, FolderLevel2"
-        order_cols = "FileCount DESC, FolderLevel1, FolderLevel2"
+        select_cols = "d.FolderLevel1, d.FolderLevel2"
+        group_cols = "d.FolderLevel1, d.FolderLevel2"
+        order_cols = "FileCount DESC, d.FolderLevel1, d.FolderLevel2"
     else:
-        select_cols = "FolderLevel1"
-        group_cols = "FolderLevel1"
-        order_cols = "FileCount DESC, FolderLevel1"
+        select_cols = "d.FolderLevel1"
+        group_cols = "d.FolderLevel1"
+        order_cols = "FileCount DESC, d.FolderLevel1"
+
+    hint_sql, hint_params = _build_query_hint_sql(hints, alias="d")
 
     sql = f"""
     SELECT
         {select_cols},
         COUNT(*) AS FileCount,
-        ROUND(SUM(FileSizeBytes)::NUMERIC / 1024 / 1024, 2) AS TotalSizeMB,
-        SUM(CASE WHEN ParseStatus='Success' THEN 1 ELSE 0 END) AS ParsedSuccess,
-        SUM(CASE WHEN ParseStatus='Failed' THEN 1 ELSE 0 END) AS ParsedFailed
-    FROM Document
+        ROUND(SUM(d.FileSizeBytes)::NUMERIC / 1024 / 1024, 2) AS TotalSizeMB,
+        SUM(CASE WHEN d.ParseStatus='Success' THEN 1 ELSE 0 END) AS ParsedSuccess,
+        SUM(CASE WHEN d.ParseStatus='Failed' THEN 1 ELSE 0 END) AS ParsedFailed
+    FROM Document d
+    WHERE {hint_sql}
     GROUP BY {group_cols}
     ORDER BY {order_cols}
     LIMIT %s;
     """
 
-    return execute_select(conn, sql, (limit,), trace_name="CategoryStats")
+    return execute_select(conn, sql, tuple(hint_params + [limit]), trace_name="CategoryStats")
 
 
-def get_catalog_summary_for_gpt(conn):
+def get_catalog_summary_for_gpt(conn, hints=None):
     """Small multi-section catalogue summary, not full 1810 metadata rows."""
     return {
-        "file_count": get_file_count(conn),
-        "category_stats": get_category_stats(conn, level=1, limit=50),
-        "type_stats": get_type_count(conn),
+        "file_count": get_file_count(conn, hints=hints),
+        "category_stats": get_category_stats(conn, level=1, limit=50, hints=hints),
+        "type_stats": get_type_count(conn, hints=hints),
     }
 
 
@@ -1726,39 +1911,43 @@ def _build_scope_sql(scope, mode):
     return hard_sql, hard_params, soft_score_sql, soft_score_params
 
 
-def count_scoped_documents(conn, scope, mode):
+def count_scoped_documents(conn, scope, mode, hints=None):
     if mode != "HARD":
         return None
 
     scope_sql, scope_params, _, _ = _build_scope_sql(scope, "HARD")
+    hint_sql, hint_params = _build_query_hint_sql(hints, alias="d")
     row = execute_select(
         conn,
         f"""
         SELECT COUNT(*) AS ScopedDocuments
         FROM Document d
-        WHERE {scope_sql};
+        WHERE ({scope_sql})
+          AND ({hint_sql});
         """,
-        tuple(scope_params),
+        tuple(scope_params + hint_params),
         fetch="one",
         trace_name="CountScopedDocuments",
     )
     return int((row or {}).get("ScopedDocuments") or 0)
 
 
-def count_scoped_chunks(conn, scope, mode):
+def count_scoped_chunks(conn, scope, mode, hints=None):
     if mode != "HARD":
         return None
 
     scope_sql, scope_params, _, _ = _build_scope_sql(scope, "HARD")
+    hint_sql, hint_params = _build_query_hint_sql(hints, alias="d")
     row = execute_select(
         conn,
         f"""
         SELECT COUNT(*) AS ScopedChunks
         FROM DocumentChunk c
         JOIN Document d ON d.DocID = c.DocID
-        WHERE {scope_sql};
+        WHERE ({scope_sql})
+          AND ({hint_sql});
         """,
-        tuple(scope_params),
+        tuple(scope_params + hint_params),
         fetch="one",
         trace_name="CountScopedChunks",
     )
@@ -1880,7 +2069,7 @@ def _build_postgres_chunk_match(search_query):
     )
 
 
-def search_chunks(conn, search_query, limit=120, scope=None, scope_mode="GLOBAL"):
+def search_chunks(conn, search_query, limit=120, scope=None, scope_mode="GLOBAL", hints=None):
     where_sql, score_sql, where_params, score_params = _build_postgres_chunk_match(
         search_query
     )
@@ -1889,6 +2078,7 @@ def search_chunks(conn, search_query, limit=120, scope=None, scope_mode="GLOBAL"
     hard_scope_sql, hard_scope_params, soft_score_sql, soft_score_params = _build_scope_sql(
         scope or {}, scope_mode
     )
+    hint_sql, hint_params = _build_query_hint_sql(hints, alias="d")
 
     combined_score_sql = score_sql
     if scope_mode == "SOFT" and soft_score_sql != "0.0":
@@ -1914,6 +2104,7 @@ def search_chunks(conn, search_query, limit=120, scope=None, scope_mode="GLOBAL"
     JOIN Document d ON c.DocID = d.DocID
     WHERE {where_sql}
       AND ({hard_scope_sql if scope_mode == "HARD" else "TRUE"})
+      AND ({hint_sql})
     ORDER BY Score DESC, c.ChunkID
     LIMIT %s;
     """
@@ -1924,6 +2115,7 @@ def search_chunks(conn, search_query, limit=120, scope=None, scope_mode="GLOBAL"
     params.extend(where_params)
     if scope_mode == "HARD":
         params.extend(hard_scope_params)
+    params.extend(hint_params)
     params.append(limit)
 
     return execute_select(
@@ -1934,23 +2126,26 @@ def search_chunks(conn, search_query, limit=120, scope=None, scope_mode="GLOBAL"
     )
 
 
-def count_matching_chunks(conn, search_query, scope=None, scope_mode="GLOBAL"):
+def count_matching_chunks(conn, search_query, scope=None, scope_mode="GLOBAL", hints=None):
     """Count total text-matching chunks before LIMIT, respecting HARD scope."""
     where_sql, _, where_params, _ = _build_postgres_chunk_match(search_query)
     scope_mode = (scope_mode or "GLOBAL").upper()
     hard_scope_sql, hard_scope_params, _, _ = _build_scope_sql(scope or {}, scope_mode)
+    hint_sql, hint_params = _build_query_hint_sql(hints, alias="d")
 
     sql = f"""
     SELECT COUNT(*) AS MatchedChunks
     FROM DocumentChunk c
     JOIN Document d ON d.DocID = c.DocID
     WHERE {where_sql}
-      AND ({hard_scope_sql if scope_mode == "HARD" else "TRUE"});
+      AND ({hard_scope_sql if scope_mode == "HARD" else "TRUE"})
+      AND ({hint_sql});
     """
 
     params = list(where_params)
     if scope_mode == "HARD":
         params.extend(hard_scope_params)
+    params.extend(hint_params)
 
     row = execute_select(
         conn,
@@ -2030,27 +2225,26 @@ def group_chunks_to_docs(chunks, doc_limit=50, score_top_n=3):
 
 def extract_explicit_semantic_override(user_question):
     """
-    <concept> is a power-user override for semantic content retrieval.
+    Compatibility wrapper around the generic query-hint parser.
+
+    Both <concept> and <semantic:concept> are semantic overrides. Named
+    metadata hints such as <ext:pdf> and <file:fomc> are not semantic terms.
 
     Returns:
       cleaned_question: question with the first <...> removed
       has_override:     True when angle brackets were explicitly supplied
       concept:          text inside <...>; empty string means force no semantic filtering
     """
-    text = str(user_question or "")
-    match = re.search(r"<([^<>]*)>", text)
-    if not match:
-        return text, False, None
-
-    concept = match.group(1).strip()
-    cleaned = (text[:match.start()] + " " + text[match.end():]).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned, True, concept
+    cleaned, hints = parse_query_hints(user_question)
+    has_override = bool(hints.get("semantic_present"))
+    concept = hints.get("semantic") if has_override else None
+    return cleaned, has_override, concept
 
 
-def get_scoped_chunks(conn, scope, limit=500, max_chars=3000):
+def get_scoped_chunks(conn, scope, limit=500, max_chars=3000, hints=None):
     """Directly load chunks from a HARD metadata scope without semantic keyword filtering."""
     hard_scope_sql, hard_scope_params, _, _ = _build_scope_sql(scope or {}, "HARD")
+    hint_sql, hint_params = _build_query_hint_sql(hints, alias="d")
     sql = f"""
     SELECT
         c.ChunkID,
@@ -2069,21 +2263,35 @@ def get_scoped_chunks(conn, scope, limit=500, max_chars=3000):
         1.0 AS Score
     FROM DocumentChunk c
     JOIN Document d ON c.DocID = d.DocID
-    WHERE {hard_scope_sql}
+    WHERE ({hard_scope_sql})
+      AND ({hint_sql})
     ORDER BY d.DocID, c.ChunkNo, c.ChunkID
     LIMIT %s;
     """
     params = [max_chars]
     params.extend(hard_scope_params)
+    params.extend(hint_params)
     params.append(limit)
     return execute_select(conn, sql, tuple(params), trace_name="DirectScopedChunks_HARD")
 
 
-def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="AUTO"):
-    if THREAD["docs"] and not force_new_search:
+def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="AUTO", hints=None):
+    if hints is None:
+        user_question, hints = parse_query_hints(user_question)
+    else:
+        hints = hints or empty_query_hints()
+    current_hint_signature = query_hint_signature(hints)
+
+    if (
+        THREAD["docs"]
+        and not force_new_search
+        and THREAD.get("last_query_hints") == current_hint_signature
+    ):
         return THREAD["docs"], THREAD["last_search_query"], False, THREAD.get("retrieval_stats", {})
 
-    planner_question, has_semantic_override, semantic_override = extract_explicit_semantic_override(user_question)
+    planner_question = user_question
+    has_semantic_override = bool(hints.get("semantic_present"))
+    semantic_override = hints.get("semantic") if has_semantic_override else None
     scope_plan = plan_rag_scope(planner_question, requested_mode=rag_scope_mode)
     effective_mode = scope_plan["effective_mode"]
     scope = scope_plan["scope"]
@@ -2119,8 +2327,8 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
     top_docs = get_int_setting(conn, "TopKDocuments", 50)
     chunk_limit = max(200, top_docs * 10) if effective_mode == "HARD" else max(500, top_docs * 10)
 
-    scoped_documents = count_scoped_documents(conn, scope, effective_mode)
-    scoped_chunks = count_scoped_chunks(conn, scope, effective_mode)
+    scoped_documents = count_scoped_documents(conn, scope, effective_mode, hints=hints)
+    scoped_chunks = count_scoped_chunks(conn, scope, effective_mode, hints=hints)
 
     direct_scoped_retrieval = (
         effective_mode == "HARD"
@@ -2133,7 +2341,13 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
         # the documents, so do not search for task words such as summary/key points.
         # Load scoped chunks directly for GPT summarization/reasoning.
         direct_limit = max(chunk_limit, min(int(scoped_chunks or 0), 1000))
-        chunks = get_scoped_chunks(conn, scope, limit=direct_limit, max_chars=3000)
+        chunks = get_scoped_chunks(
+            conn,
+            scope,
+            limit=direct_limit,
+            max_chars=3000,
+            hints=hints,
+        )
         matched_chunks = len(chunks)
         context_chunks_per_doc = 20
         ranking_method = "HARD_METADATA_DIRECT_SCOPED_CHUNKS"
@@ -2143,6 +2357,7 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
             search_query,
             scope=scope,
             scope_mode=effective_mode,
+            hints=hints,
         )
         chunks = search_chunks(
             conn,
@@ -2150,6 +2365,7 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
             limit=chunk_limit,
             scope=scope,
             scope_mode=effective_mode,
+            hints=hints,
         )
         context_chunks_per_doc = 3
         ranking_method = (
@@ -2172,6 +2388,8 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
         "RAGScopeReason": scope_plan.get("reason"),
         "SemanticOverridePresent": has_semantic_override,
         "SemanticOverrideConcept": semantic_override if has_semantic_override else None,
+        "QueryHints": query_hints_for_log(hints),
+        "QueryHintSignature": current_hint_signature,
         "SemanticQuery": search_query,
         "DirectScopedRetrieval": direct_scoped_retrieval,
         "ScopedDocuments": scoped_documents,
@@ -2193,6 +2411,7 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
     THREAD["last_rag_scope"] = scope
     THREAD["last_rag_scope_mode"] = effective_mode
     THREAD["last_semantic_query"] = search_query
+    THREAD["last_query_hints"] = current_hint_signature
 
     return docs, search_query, True, stats
 
@@ -2516,6 +2735,23 @@ CATALOG: question
   强制走 CATALOG。
   例：CATALOG: 把知识库资料按主题分类
 
+Generic query hints（可组合，位置不限，建议写在问题开头）:
+  <semantic:interest rate risk>  覆盖 semantic retrieval term。
+  <ext:pdf,docx>                 只在指定扩展名中检索。
+  <file:fomc,minutes>            只在文件名包含这些词的文件中检索。
+
+Backward compatible semantic shortcuts:
+  <interest rate risk>           等同于 <semantic:interest rate risk>
+  <>                             明确关闭 semantic keyword filtering
+
+Hint combination example:
+  RAG: <ext:pdf,html> <file:fomc> <semantic:rate cut> 总结主要政策信号
+
+Hint rules:
+- 同一个 ext/file hint 内多个值是 OR；不同 hint 之间是 AND。
+- 支持英文/中文冒号和逗号，例如 <ext：pdf，docx>。
+- Unknown named hints return an error instead of being silently ignored.
+
 IMPORTANT:
 - Prefix 不区分大小写，例如 rag: / RAG: 都可以。
 - Prefix 只在问题最前面生效。
@@ -2549,6 +2785,7 @@ def reset_thread():
         "last_rag_scope": {},
         "last_rag_scope_mode": "AUTO",
         "last_semantic_query": "",
+        "last_query_hints": {},
     }
 
 
@@ -2562,6 +2799,7 @@ def show_thread():
     print("Last RAG scope mode:", THREAD.get("last_rag_scope_mode") or "(none)")
     print("Last RAG scope:", json.dumps(THREAD.get("last_rag_scope") or {}, ensure_ascii=False))
     print("Last semantic query:", THREAD.get("last_semantic_query") or "(none)")
+    print("Last query hints:", THREAD.get("last_query_hints") or "(none)")
     print("\nSummary:")
     print(THREAD["summary"] or "(empty)")
     print("\nRetrieved documents:")
@@ -2577,24 +2815,25 @@ def show_thread():
 # Executors
 # =====================================================
 
-def run_metadata(conn, user_question, intent, route):
+def run_metadata(conn, user_question, intent, route, hints=None):
+    hints = hints or empty_query_hints()
     set_execution_mode("METADATA_SQL", "GPT_MARKDOWN")
     if intent == "FILE_COUNT":
         print("\nSearch Mode: METADATA_SQL")
         print("Presentation: GPT text / markdown\n")
-        print_rows([get_file_count(conn)], user_question, title="File count summary")
+        print_rows([get_file_count(conn, hints=hints)], user_question, title="File count summary")
         return True
 
     if intent == "TYPE_COUNT":
         print("\nSearch Mode: METADATA_SQL")
         print("Presentation: GPT text / markdown\n")
-        print_rows(get_type_count(conn), user_question, title="File type statistics")
+        print_rows(get_type_count(conn, hints=hints), user_question, title="File type statistics")
         return True
 
     if intent == "FOLDER_CATALOG":
         print("\nSearch Mode: METADATA_SQL")
         print("Presentation: GPT text / markdown\n")
-        print_rows(get_folder_catalog(conn, limit=120), user_question, title="Folder/category catalogue")
+        print_rows(get_folder_catalog(conn, limit=120, hints=hints), user_question, title="Folder/category catalogue")
         return True
 
     if intent == "FILE_LIST":
@@ -2604,7 +2843,7 @@ def run_metadata(conn, user_question, intent, route):
         # Sorting-style metadata question:
         # Do not treat phrases such as "latest updates" as filename keywords.
         if is_latest_modified_question(user_question):
-            rows = get_latest_modified_files(conn, limit=1)
+            rows = get_latest_modified_files(conn, limit=1, hints=hints)
             print_rows(
                 rows,
                 user_question,
@@ -2621,7 +2860,7 @@ def run_metadata(conn, user_question, intent, route):
             category = resolve_folder_level1(conn, route.get("search_query", ""))
 
         if category:
-            rows = list_files_by_folder_level1(conn, category, limit=120)
+            rows = list_files_by_folder_level1(conn, category, limit=120, hints=hints)
             print_rows(
                 rows,
                 user_question,
@@ -2635,14 +2874,15 @@ def run_metadata(conn, user_question, intent, route):
         if keyword.lower() in ("list files", "files", "file list"):
             keyword = None
 
-        rows = list_files(conn, keyword=keyword, limit=120)
+        rows = list_files(conn, keyword=keyword, limit=120, hints=hints)
         print_rows(rows, user_question, title="File list", max_rows=80)
         return True
 
     return False
 
 
-def run_catalog_text(conn, user_question):
+def run_catalog_text(conn, user_question, hints=None):
+    hints = hints or empty_query_hints()
     set_execution_mode("CATALOG_SQL_AGGREGATION", "GPT_MARKDOWN")
     """
     CATALOG intent should not dump all document metadata into GPT.
@@ -2655,14 +2895,31 @@ def run_catalog_text(conn, user_question):
 
     q = user_question.lower()
 
+    # File-type questions must be checked before the generic statistics branch.
+    type_phrase_keywords = [
+        "扩展名", "文件类型", "文件格式",
+        "extension", "file type", "file types", "file format", "file formats"
+    ]
+    type_name_pattern = re.compile(
+        r"(?<![a-z0-9])"
+        r"(?:pdfs?|html?|mhtml|mht|docx?|xlsx?|pptx?|csv|txt|word|excel|powerpoint)"
+        r"(?![a-z0-9])",
+        flags=re.I,
+    )
+
+    if any(k in q for k in type_phrase_keywords) or type_name_pattern.search(q):
+        rows = get_type_count(conn, hints=hints)
+        print_rows(rows, user_question, title="File type statistics", max_rows=80)
+        return True
+
     # For classification/statistics questions, category aggregation is the best default.
     if any(k in q for k in ["分类", "category", "categories", "统计", "count", "group", "按类别"]):
-        rows = get_category_stats(conn, level=1, limit=80)
+        rows = get_category_stats(conn, level=1, limit=80, hints=hints)
         print_rows(rows, user_question, title="Category statistics", max_rows=80)
         return True
 
     # For general catalogue/index questions, send compact summary sections instead of 1810 rows.
-    summary = get_catalog_summary_for_gpt(conn)
+    summary = get_catalog_summary_for_gpt(conn, hints=hints)
     pseudo_rows = [
         {"Section": "File Count", "Data": json.dumps(summary["file_count"], ensure_ascii=False, default=str)},
         {"Section": "Top Categories", "Data": json.dumps(summary["category_stats"], ensure_ascii=False, default=str)},
@@ -2672,9 +2929,24 @@ def run_catalog_text(conn, user_question):
     return True
 
 
-def run_search_only(conn, user_question):
+def run_search_only(conn, user_question, hints=None):
+    hints = hints or empty_query_hints()
     set_execution_mode("SEARCH_ONLY", "RAW_TEXT")
-    rewritten = rewrite_search_query(user_question)
+
+    if hints.get("semantic_present"):
+        semantic_input = str(hints.get("semantic") or "").strip()
+        if not semantic_input:
+            print("Document Search requires a non-empty semantic hint or search question.")
+            if CURRENT_EXECUTION is not None:
+                CURRENT_EXECUTION["ExecutionStatus"] = "InvalidHint"
+                CURRENT_EXECUTION["ErrorStage"] = "HINT_PARSING"
+                CURRENT_EXECUTION["ErrorType"] = "EmptySemanticSearch"
+                CURRENT_EXECUTION["ErrorMessage"] = "Empty semantic hint cannot drive Document Search."
+            return
+    else:
+        semantic_input = user_question
+
+    rewritten = rewrite_search_query(semantic_input)
 
     # The GUI should highlight the same original/expanded terms that core
     # actually uses for PostgreSQL matching, rather than guessing them.
@@ -2683,7 +2955,16 @@ def run_search_only(conn, user_question):
 
     set_gui_highlight_terms(original_terms + highlight_terms)
 
-    chunks = search_chunks(conn, rewritten["search_query"], limit=50)
+    chunks = search_chunks(conn, rewritten["search_query"], limit=50, hints=hints)
+
+    if CURRENT_EXECUTION is not None:
+        CURRENT_EXECUTION["SearchQuery"] = rewritten["search_query"]
+        CURRENT_EXECUTION["NewSearch"] = True
+        CURRENT_EXECUTION["RetrievalStats"] = {
+            "QueryHints": query_hints_for_log(hints),
+            "ChunksRetrieved": len(chunks),
+            "DocumentsSent": 0,
+        }
 
     # Classic SEARCH results also expose their source documents to GUI.
     seen_docs = {}
@@ -2722,7 +3003,7 @@ def run_search_only(conn, user_question):
         )
 
 
-def run_rag(conn, user_question, intent, force_new_search=False, rag_scope_mode="AUTO"):
+def run_rag(conn, user_question, intent, force_new_search=False, rag_scope_mode="AUTO", hints=None):
     start = time.time()
 
     docs, search_query, searched, retrieval_stats = retrieve_docs(
@@ -2730,6 +3011,7 @@ def run_rag(conn, user_question, intent, force_new_search=False, rag_scope_mode=
         user_question,
         force_new_search=force_new_search,
         rag_scope_mode=rag_scope_mode,
+        hints=hints,
     )
 
     effective_scope_mode = retrieval_stats.get("RAGScopeMode", "GLOBAL")
@@ -2946,6 +3228,25 @@ def detect_user_command(user_question):
 def process_user_question(conn, user_question):
     """Execute one user request. Final logging is handled by main()."""
     reset_gui_result()
+
+    try:
+        user_question, hints = parse_query_hints(user_question)
+    except QueryHintError as exc:
+        set_execution_mode("HINT_ERROR", "CONSOLE_TEXT")
+        print(f"Invalid query hint: {exc}")
+        if CURRENT_EXECUTION is not None:
+            CURRENT_EXECUTION["ExecutionStatus"] = "InvalidHint"
+            CURRENT_EXECUTION["ErrorStage"] = "HINT_PARSING"
+            CURRENT_EXECUTION["ErrorType"] = type(exc).__name__
+            CURRENT_EXECUTION["ErrorMessage"] = str(exc)
+        return
+
+    if CURRENT_EXECUTION is not None:
+        CURRENT_EXECUTION["QueryHints"] = query_hints_for_log(hints)
+        CURRENT_EXECUTION["RetrievalStats"] = {
+            "QueryHints": query_hints_for_log(hints)
+        }
+
     qlower = user_question.lower()
 
     if qlower == "/help":
@@ -2978,6 +3279,7 @@ def process_user_question(conn, user_question):
         THREAD["last_rag_scope"] = {}
         THREAD["last_rag_scope_mode"] = "AUTO"
         THREAD["last_semantic_query"] = ""
+        THREAD["last_query_hints"] = {}
         print("Cleared retrieval cache, RAG scope state and current-document binding. Conversation history was kept.")
         return
 
@@ -2992,14 +3294,14 @@ def process_user_question(conn, user_question):
         set_execution_mode("METADATA_SQL", "GPT_MARKDOWN")
         if CURRENT_EXECUTION is not None:
             CURRENT_EXECUTION["RouterIntent"] = "FILE_COUNT"
-        print_rows([get_file_count(conn)], user_question, title="File count summary")
+        print_rows([get_file_count(conn, hints=hints)], user_question, title="File count summary")
         return
 
     if qlower == "/types":
         set_execution_mode("METADATA_SQL", "GPT_MARKDOWN")
         if CURRENT_EXECUTION is not None:
             CURRENT_EXECUTION["RouterIntent"] = "TYPE_COUNT"
-        print_rows(get_type_count(conn), user_question, title="File type statistics")
+        print_rows(get_type_count(conn, hints=hints), user_question, title="File type statistics")
         return
 
     if qlower == "/folders":
@@ -3007,7 +3309,7 @@ def process_user_question(conn, user_question):
         if CURRENT_EXECUTION is not None:
             CURRENT_EXECUTION["RouterIntent"] = "FOLDER_CATALOG"
         print_rows(
-            get_folder_catalog(conn, limit=120),
+            get_folder_catalog(conn, limit=120, hints=hints),
             user_question,
             title="Folder/category catalogue"
         )
@@ -3019,7 +3321,7 @@ def process_user_question(conn, user_question):
             CURRENT_EXECUTION["RouterIntent"] = "FILE_LIST"
         keyword = user_question[6:].strip()
         print_rows(
-            list_files(conn, keyword if keyword else None, limit=120),
+            list_files(conn, keyword if keyword else None, limit=120, hints=hints),
             user_question,
             title="File list"
         )
@@ -3031,7 +3333,7 @@ def process_user_question(conn, user_question):
             CURRENT_EXECUTION["RouterIntent"] = "FILE_LIST"
             CURRENT_EXECUTION["RouterSearchQuery"] = ""
         print_rows(
-            get_latest_modified_files(conn, limit=1),
+            get_latest_modified_files(conn, limit=1, hints=hints),
             user_question,
             title="Latest modified file",
             max_rows=1
@@ -3044,7 +3346,7 @@ def process_user_question(conn, user_question):
             CURRENT_EXECUTION["RouterIntent"] = "FILE_LIST"
         keyword = user_question[10:].strip()
         print_rows(
-            browse_summaries(conn, keyword if keyword else None, limit=80),
+            browse_summaries(conn, keyword if keyword else None, limit=80, hints=hints),
             user_question,
             title="Document summaries"
         )
@@ -3053,7 +3355,7 @@ def process_user_question(conn, user_question):
     if qlower.startswith("/search "):
         if CURRENT_EXECUTION is not None:
             CURRENT_EXECUTION["RouterIntent"] = "SEARCH_ONLY"
-        run_search_only(conn, user_question[8:].strip())
+        run_search_only(conn, user_question[8:].strip(), hints=hints)
         return
 
     if qlower.startswith("/refresh "):
@@ -3066,6 +3368,7 @@ def process_user_question(conn, user_question):
             "RAG_ANSWER",
             force_new_search=True,
             rag_scope_mode="AUTO",
+            hints=hints,
         )
         return
 
@@ -3074,7 +3377,8 @@ def process_user_question(conn, user_question):
             CURRENT_EXECUTION["RouterIntent"] = "CATALOG"
         run_catalog_text(
             conn,
-            user_question[8:].strip() or "Prepare a catalogue summary"
+            user_question[8:].strip() or "Prepare a catalogue summary",
+            hints=hints,
         )
         return
 
@@ -3102,6 +3406,7 @@ def process_user_question(conn, user_question):
                 "forced_by_prefix": True,
                 "switch": switch_name,
                 "rag_scope_mode": forced_rag_scope_mode,
+                "query_hints": query_hints_for_log(hints),
             }
             CURRENT_EXECUTION["RouterSearchQuery"] = forced_question
             CURRENT_EXECUTION["RouterTopicTitle"] = f"Forced {switch_name}"
@@ -3112,7 +3417,19 @@ def process_user_question(conn, user_question):
         else:
             print(f"\nForced route switch: {switch_name}: -> {forced_intent}")
 
-        if not forced_question:
+        hint_can_supply_input = bool(
+            hints.get("ext")
+            or hints.get("file")
+            or (
+                forced_intent == "SEARCH_ONLY"
+                and hints.get("semantic_present")
+                and str(hints.get("semantic") or "").strip()
+            )
+        )
+
+        if not forced_question and not (
+            hint_can_supply_input and forced_intent in {"SEARCH_ONLY", "FILE_LIST", "CATALOG"}
+        ):
             set_execution_mode("COMMAND", "CONSOLE_TEXT")
             print(f"{switch_name}: 后面没有问题或搜索内容。")
             if CURRENT_EXECUTION is not None:
@@ -3128,21 +3445,26 @@ def process_user_question(conn, user_question):
                 "RAG_ANSWER",
                 force_new_search=True,
                 rag_scope_mode=forced_rag_scope_mode or "AUTO",
+                hints=hints,
             )
             return
 
         if forced_intent == "SEARCH_ONLY":
-            run_search_only(conn, forced_question)
+            run_search_only(conn, forced_question, hints=hints)
             return
 
         if forced_intent == "FILE_LIST":
             set_execution_mode("METADATA_SQL", "GPT_MARKDOWN")
-            rows = list_files(conn, forced_question, limit=120)
-            print_rows(rows, forced_question, title="File list")
+            rows = list_files(conn, forced_question or None, limit=120, hints=hints)
+            print_rows(rows, forced_question or "List files matching the query hints", title="File list")
             return
 
         if forced_intent == "CATALOG":
-            run_catalog_text(conn, forced_question)
+            run_catalog_text(
+                conn,
+                forced_question or "Prepare a catalogue summary",
+                hints=hints,
+            )
             return
 
 
@@ -3195,15 +3517,15 @@ def process_user_question(conn, user_question):
             CURRENT_EXECUTION["PresentationMode"] = "CONSOLE_TEXT"
         return
 
-    if run_metadata(conn, user_question, intent, route):
+    if run_metadata(conn, user_question, intent, route, hints=hints):
         return
 
     if intent == "SEARCH_ONLY":
-        run_search_only(conn, user_question)
+        run_search_only(conn, user_question, hints=hints)
         return
 
     if intent == "CATALOG":
-        run_catalog_text(conn, user_question)
+        run_catalog_text(conn, user_question, hints=hints)
         return
 
     if intent == "RAG_ANSWER":
@@ -3213,6 +3535,7 @@ def process_user_question(conn, user_question):
             "RAG_ANSWER",
             force_new_search=route.get("force_new_search", False),
             rag_scope_mode="AUTO",
+            hints=hints,
         )
         return
 
@@ -3222,6 +3545,7 @@ def process_user_question(conn, user_question):
         "RAG_ANSWER",
         force_new_search=False,
         rag_scope_mode="AUTO",
+        hints=hints,
     )
 
 
