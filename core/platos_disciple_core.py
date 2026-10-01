@@ -778,7 +778,7 @@ Current thread summary:
 # Generic query hints
 # =====================================================
 
-SUPPORTED_QUERY_HINTS = {"semantic", "ext", "file"}
+SUPPORTED_QUERY_HINTS = {"semantic", "ext", "file", "task"}
 
 
 class QueryHintError(ValueError):
@@ -789,6 +789,8 @@ def empty_query_hints():
     return {
         "semantic_present": False,
         "semantic": None,
+        "task_present": False,
+        "task": None,
         "ext": [],
         "file": [],
     }
@@ -814,6 +816,7 @@ def parse_query_hints(user_question):
 
     Canonical named hints:
       <semantic:interest rate risk>  semantic retrieval override
+      <task:summarize briefly>      final task-instruction override
       <ext:pdf,docx>                 hard file-extension filter
       <file:fomc,minutes>            hard filename-contains filter
 
@@ -828,6 +831,7 @@ def parse_query_hints(user_question):
     original = str(user_question or "")
     hints = empty_query_hints()
     semantic_seen = False
+    task_seen = False
     spans = []
 
     for match in re.finditer(r"<([^<>]*)>", original):
@@ -855,6 +859,15 @@ def parse_query_hints(user_question):
             semantic_seen = True
             hints["semantic_present"] = True
             hints["semantic"] = value
+
+        elif key == "task":
+            if task_seen:
+                raise QueryHintError("Only one <task:...> hint is allowed.")
+            task_seen = True
+            if not value:
+                raise QueryHintError("<task:...> requires a task instruction.")
+            hints["task_present"] = True
+            hints["task"] = value
 
         elif key == "ext":
             values = []
@@ -892,6 +905,8 @@ def query_hints_for_log(hints):
     return {
         "semantic_present": bool(hints.get("semantic_present")),
         "semantic": hints.get("semantic") if hints.get("semantic_present") else None,
+        "task_present": bool(hints.get("task_present")),
+        "task": hints.get("task") if hints.get("task_present") else None,
         "ext": list(hints.get("ext") or []),
         "file": list(hints.get("file") or []),
     }
@@ -1696,7 +1711,7 @@ Rules:
 4. GLOBAL when the question intentionally spans the KB or has no useful scope.
 5. You may normalize a well-known company name to ticker only when highly confident.
 6. semantic_query should describe what CONTENT/TOPIC to find INSIDE the scoped documents.
-7. If the user only asks for an operation such as summary, key points, highlights, overview, summarize, 要点, 总结, 概括, 展示要点, and does not specify a content topic, semantic_query MUST be an empty string. Task words are not retrieval keywords.
+7. Separate the operational instruction from subject matter expected to appear in source documents. If no subject matter is specified, semantic_query MUST be an empty string. Never copy or expand task instructions into retrieval keywords.
 8. Remove metadata-only terms such as ticker/year/form type from semantic_query when possible.
 9. date_from/date_to refer to the document/business date such as filing_date.
 10. created_from/created_to refer to Document.CreatedAt, meaning when the file was added/indexed/scanned into this KB.
@@ -1794,6 +1809,24 @@ def _scope_has_constraints(scope):
         or bool(scope.get("created_from"))
         or bool(scope.get("created_to"))
     )
+
+
+def _query_hints_have_scope(hints):
+    """Return True when explicit hints identify a document/file set."""
+    hints = hints or empty_query_hints()
+    return bool(hints.get("file") or hints.get("ext"))
+
+
+def _empty_rag_scope():
+    """Create a normalized metadata scope with no predicates."""
+    scope = {key: [] for key in SUPPORTED_SCOPE_KEYS}
+    scope.update({
+        "date_from": None,
+        "date_to": None,
+        "created_from": None,
+        "created_to": None,
+    })
+    return scope
 
 
 def _build_scope_sql(scope, mode):
@@ -1954,21 +1987,44 @@ def count_scoped_chunks(conn, scope, mode, hints=None):
     return int((row or {}).get("ScopedChunks") or 0)
 
 
-def plan_rag_scope(user_question, requested_mode="AUTO"):
+def plan_rag_scope(user_question, requested_mode="AUTO", hints=None):
     requested_mode = (requested_mode or "AUTO").upper()
     if requested_mode not in RAG_SCOPE_MODES:
         requested_mode = "AUTO"
 
     plan = extract_rag_scope(user_question)
 
-    effective_mode = (
-        plan["recommended_mode"]
-        if requested_mode == "AUTO"
-        else requested_mode
-    )
+    # Explicit file/extension hints are themselves a hard document scope.
+    # Reflect that fact in diagnostics instead of leaving the planner's
+    # natural-language-only recommendation/reason unchanged.
+    hint_constraints = []
+    if (hints or {}).get("file"):
+        hint_constraints.append("file")
+    if (hints or {}).get("ext"):
+        hint_constraints.append("ext")
+
+    if hint_constraints:
+        plan["explicit_constraints"] = hint_constraints
+        plan["recommended_mode"] = "HARD"
+        plan["reason"] = (
+            "Explicit query hints define a hard document scope: "
+            + ", ".join(hint_constraints)
+            + "."
+        )
+
+    if requested_mode == "AUTO":
+        # File/extension hints are explicit hard filters regardless of what the
+        # natural-language scope planner infers from the remaining question.
+        effective_mode = "HARD" if _query_hints_have_scope(hints) else plan["recommended_mode"]
+    else:
+        effective_mode = requested_mode
 
     # A forced HARD/SOFT with no usable metadata cannot do meaningful scoping.
-    if effective_mode in {"HARD", "SOFT"} and not _scope_has_constraints(plan["scope"]):
+    if (
+        effective_mode in {"HARD", "SOFT"}
+        and not _scope_has_constraints(plan["scope"])
+        and not _query_hints_have_scope(hints)
+    ):
         effective_mode = "GLOBAL"
 
     plan["requested_mode"] = requested_mode
@@ -2289,10 +2345,55 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
     ):
         return THREAD["docs"], THREAD["last_search_query"], False, THREAD.get("retrieval_stats", {})
 
-    planner_question = user_question
+    task_override = (
+        str(hints.get("task") or "").strip()
+        if hints.get("task_present")
+        else ""
+    )
     has_semantic_override = bool(hints.get("semantic_present"))
     semantic_override = hints.get("semantic") if has_semantic_override else None
-    scope_plan = plan_rag_scope(planner_question, requested_mode=rag_scope_mode)
+
+    # With an explicit semantic hint, all remaining natural-language text is
+    # task instruction. Do not let the scope planner reinterpret that text (or
+    # thread context) as semantic terms or implicit metadata constraints.
+    if has_semantic_override:
+        requested_mode = (rag_scope_mode or "AUTO").upper()
+        if requested_mode not in RAG_SCOPE_MODES:
+            requested_mode = "AUTO"
+        has_hint_scope = _query_hints_have_scope(hints)
+        if requested_mode == "AUTO":
+            effective_mode = "HARD" if has_hint_scope else "GLOBAL"
+        elif requested_mode in {"HARD", "SOFT"} and not has_hint_scope:
+            effective_mode = "GLOBAL"
+        else:
+            effective_mode = requested_mode
+
+        explicit_constraints = []
+        if hints.get("file"):
+            explicit_constraints.append("file")
+        if hints.get("ext"):
+            explicit_constraints.append("ext")
+
+        scope_plan = {
+            "recommended_mode": "HARD" if has_hint_scope else "GLOBAL",
+            "scope": _empty_rag_scope(),
+            "semantic_query": "",
+            "explicit_constraints": explicit_constraints,
+            "reason": "Explicit semantic hint controls retrieval; remaining text is task instruction.",
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+        }
+        planner_question = user_question or task_override
+    else:
+        # A task hint is an instruction for the final answer, never a semantic
+        # retrieval term. When it is the only remaining natural-language text,
+        # the scope planner may inspect it solely to recognize a topic-free task.
+        planner_question = user_question or task_override
+        scope_plan = plan_rag_scope(
+            planner_question,
+            requested_mode=rag_scope_mode,
+            hints=hints,
+        )
     effective_mode = scope_plan["effective_mode"]
     scope = scope_plan["scope"]
 
@@ -2327,13 +2428,33 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
     top_docs = get_int_setting(conn, "TopKDocuments", 50)
     chunk_limit = max(200, top_docs * 10) if effective_mode == "HARD" else max(500, top_docs * 10)
 
-    scoped_documents = count_scoped_documents(conn, scope, effective_mode, hints=hints)
-    scoped_chunks = count_scoped_chunks(conn, scope, effective_mode, hints=hints)
-
     direct_scoped_retrieval = (
         effective_mode == "HARD"
-        and _scope_has_constraints(scope)
+        and (_scope_has_constraints(scope) or _query_hints_have_scope(hints))
         and not search_query
+    )
+
+    # A filename hint already identifies the intended document set. For a
+    # topic-free direct read, do not intersect it with metadata inferred from
+    # thread context (for example, report date mistaken for filing date).
+    planned_scope = scope
+    retrieval_scope = (
+        _empty_rag_scope()
+        if direct_scoped_retrieval and bool(hints.get("file"))
+        else scope
+    )
+
+    scoped_documents = count_scoped_documents(
+        conn,
+        retrieval_scope,
+        effective_mode,
+        hints=hints,
+    )
+    scoped_chunks = count_scoped_chunks(
+        conn,
+        retrieval_scope,
+        effective_mode,
+        hints=hints,
     )
 
     if direct_scoped_retrieval:
@@ -2343,7 +2464,7 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
         direct_limit = max(chunk_limit, min(int(scoped_chunks or 0), 1000))
         chunks = get_scoped_chunks(
             conn,
-            scope,
+            retrieval_scope,
             limit=direct_limit,
             max_chars=3000,
             hints=hints,
@@ -2355,7 +2476,7 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
         matched_chunks = count_matching_chunks(
             conn,
             search_query,
-            scope=scope,
+            scope=retrieval_scope,
             scope_mode=effective_mode,
             hints=hints,
         )
@@ -2363,7 +2484,7 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
             conn,
             search_query,
             limit=chunk_limit,
-            scope=scope,
+            scope=retrieval_scope,
             scope_mode=effective_mode,
             hints=hints,
         )
@@ -2383,11 +2504,14 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
         "RAGScopeRequestedMode": scope_plan.get("requested_mode"),
         "RAGScopeMode": effective_mode,
         "RAGScopeRecommendedMode": scope_plan.get("recommended_mode"),
-        "RAGScope": scope,
+        "RAGScope": retrieval_scope,
+        "RAGScopePlanned": planned_scope,
         "RAGScopeExplicitConstraints": scope_plan.get("explicit_constraints"),
         "RAGScopeReason": scope_plan.get("reason"),
         "SemanticOverridePresent": has_semantic_override,
         "SemanticOverrideConcept": semantic_override if has_semantic_override else None,
+        "TaskOverridePresent": bool(hints.get("task_present")),
+        "TaskOverrideInstruction": task_override if hints.get("task_present") else None,
         "QueryHints": query_hints_for_log(hints),
         "QueryHintSignature": current_hint_signature,
         "SemanticQuery": search_query,
@@ -2408,7 +2532,7 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
     THREAD["title"] = topic_title
     THREAD["last_search_query"] = search_query
     THREAD["retrieval_stats"] = stats
-    THREAD["last_rag_scope"] = scope
+    THREAD["last_rag_scope"] = retrieval_scope
     THREAD["last_rag_scope_mode"] = effective_mode
     THREAD["last_semantic_query"] = search_query
     THREAD["last_query_hints"] = current_hint_signature
@@ -2471,7 +2595,7 @@ def mode_instruction(intent):
     return mapping.get(intent, mapping["RAG_ANSWER"])
 
 
-def answer_with_gpt(user_question, docs, intent):
+def answer_with_gpt(user_question, docs, intent, task_override=None):
     prompt = f"""
 You are a bilingual enterprise knowledge-base RAG agent.
 
@@ -2501,6 +2625,12 @@ Task:
 
 Current user question:
 {user_question}
+
+Explicit task override:
+{task_override or "(none)"}
+
+When an explicit task override is present, follow it as the requested operation.
+It is an instruction only; do not treat it as retrieved evidence.
 
 Retrieved document context:
 {build_docs_context(docs, max_chunks_per_doc=(len(docs[0]["Chunks"]) if len(docs)==1 and THREAD.get("current_document_mode") else int((THREAD.get("retrieval_stats") or {}).get("ContextChunksPerDoc") or 3)))}
@@ -2737,6 +2867,7 @@ CATALOG: question
 
 Generic query hints（可组合，位置不限，建议写在问题开头）:
   <semantic:interest rate risk>  覆盖 semantic retrieval term。
+  <task:summarize briefly>       覆盖最终回答任务；不参与检索或SQL过滤。
   <ext:pdf,docx>                 只在指定扩展名中检索。
   <file:fomc,minutes>            只在文件名包含这些词的文件中检索。
 
@@ -2746,9 +2877,11 @@ Backward compatible semantic shortcuts:
 
 Hint combination example:
   RAG: <ext:pdf,html> <file:fomc> <semantic:rate cut> 总结主要政策信号
+  RAGH: <file:fomc_minutes> <task:summarize briefly>
 
 Hint rules:
 - 同一个 ext/file hint 内多个值是 OR；不同 hint 之间是 AND。
+- task hint只控制最终回答任务，不会变成semantic keyword。
 - 支持英文/中文冒号和逗号，例如 <ext：pdf，docx>。
 - Unknown named hints return an error instead of being silently ignored.
 
@@ -3005,6 +3138,12 @@ def run_search_only(conn, user_question, hints=None):
 
 def run_rag(conn, user_question, intent, force_new_search=False, rag_scope_mode="AUTO", hints=None):
     start = time.time()
+    hints = hints or empty_query_hints()
+    task_override = (
+        str(hints.get("task") or "").strip()
+        if hints.get("task_present")
+        else None
+    )
 
     docs, search_query, searched, retrieval_stats = retrieve_docs(
         conn,
@@ -3049,6 +3188,11 @@ def run_rag(conn, user_question, intent, force_new_search=False, rag_scope_mode=
     print("New search:", searched)
 
     context_chunks_per_doc = int(retrieval_stats.get("ContextChunksPerDoc") or 3)
+    context_chars_per_chunk = (
+        3000
+        if retrieval_stats.get("DirectScopedRetrieval")
+        else 1600
+    )
     chunks_sent_est = sum(min(len(d.get("Chunks", [])), context_chunks_per_doc) for d in docs)
     print(f"Matched chunks: {retrieval_stats.get('MatchedChunks')}")
     print(f"Chunks retrieved: {retrieval_stats.get('ChunksRetrieved')} / limit {retrieval_stats.get('ChunkLimit')}")
@@ -3058,7 +3202,12 @@ def run_rag(conn, user_question, intent, force_new_search=False, rag_scope_mode=
     print("Thinking...\n")
 
     try:
-        gpt_result = answer_with_gpt(user_question, docs, intent)
+        gpt_result = answer_with_gpt(
+            user_question,
+            docs,
+            intent,
+            task_override=task_override,
+        )
         answer = gpt_result["text"]
         elapsed_ms = int((time.time() - start) * 1000)
 
@@ -3072,12 +3221,13 @@ def run_rag(conn, user_question, intent, force_new_search=False, rag_scope_mode=
         print(f"- Total tokens: {gpt_result.get('total_tokens')}")
         print(f"- Prompt chars: {gpt_result.get('prompt_chars')}")
 
+        history_question = task_override or user_question
         THREAD["history"].append({
-            "question": user_question,
+            "question": history_question,
             "answer": answer,
         })
 
-        update_thread_summary(user_question, answer)
+        update_thread_summary(history_question, answer)
         log_question(
             conn, user_question, search_query, answer, docs, elapsed_ms,
             intent=intent,
@@ -3085,6 +3235,8 @@ def run_rag(conn, user_question, intent, force_new_search=False, rag_scope_mode=
             retrieval_stats=retrieval_stats,
             llm_usage=gpt_result,
             prompt_chars=gpt_result.get("prompt_chars"),
+            max_chunks_per_doc=context_chunks_per_doc,
+            max_chars_per_chunk=context_chars_per_chunk,
         )
 
         print("\nTop retrieved documents:")
@@ -3102,6 +3254,8 @@ def run_rag(conn, user_question, intent, force_new_search=False, rag_scope_mode=
             intent=intent,
             searched=searched,
             retrieval_stats=retrieval_stats,
+            max_chunks_per_doc=context_chunks_per_doc,
+            max_chars_per_chunk=context_chars_per_chunk,
         )
         raise
 
@@ -3427,8 +3581,15 @@ def process_user_question(conn, user_question):
             )
         )
 
+        task_can_supply_rag_input = bool(
+            forced_intent == "RAG_ANSWER"
+            and hints.get("task_present")
+            and str(hints.get("task") or "").strip()
+        )
+
         if not forced_question and not (
-            hint_can_supply_input and forced_intent in {"SEARCH_ONLY", "FILE_LIST", "CATALOG"}
+            (hint_can_supply_input and forced_intent in {"SEARCH_ONLY", "FILE_LIST", "CATALOG"})
+            or task_can_supply_rag_input
         ):
             set_execution_mode("COMMAND", "CONSOLE_TEXT")
             print(f"{switch_name}: 后面没有问题或搜索内容。")
