@@ -86,10 +86,6 @@ THREAD = {
     "docs": [],
     "last_search_query": "",
     "retrieval_stats": {},
-    "current_doc_id": None,
-    "current_file_name": "",
-    "current_full_path": "",
-    "current_document_mode": False,
     "last_rag_scope": {},
     "last_rag_scope_mode": "AUTO",
     "last_semantic_query": "",
@@ -698,10 +694,6 @@ For starting a new topic.
 10. THREAD_STATUS
 For showing current thread.
 
-11. SINGLE_DOCUMENT_ANALYSIS
-For analyzing, summarizing, or asking questions about one specific file/article/document.
-Use this when the user names a specific file, especially with an extension such as .mhtml, .mht, .pdf, .docx, .xlsx, .pptx, or asks to analyze "this article", "this file", "the above document", "此文章", "这个文件", "继续分析" while a current document is active.
-
 Return this JSON:
 {{
   "intent": "...",
@@ -1276,354 +1268,6 @@ def get_catalog_summary_for_gpt(conn, hints=None):
         "category_stats": get_category_stats(conn, level=1, limit=50, hints=hints),
         "type_stats": get_type_count(conn, hints=hints),
     }
-
-
-# =====================================================
-# Single-document conversation mode
-# =====================================================
-
-DOCUMENT_EXTENSIONS = (
-    ".mhtml", ".mht", ".pdf", ".docx", ".doc",
-    ".xlsx", ".xls", ".pptx", ".ppt",
-    ".txt", ".html", ".htm"
-)
-
-
-def _clean_extracted_filename(value):
-    """Normalize a filename extracted from a natural-language request."""
-    if not value:
-        return None
-
-    name = str(value).strip()
-
-    # Remove surrounding Chinese/English quotation marks and brackets.
-    name = name.strip(" \t\r\n\"'“”‘’《》〈〉【】[]()（）")
-
-    # Remove natural-language prefixes repeatedly.
-    prefix_pattern = re.compile(
-        r"^(?:请\s*)?(?:帮我\s*)?(?:阅读|分析|总结|概括|查看|打开|研究|解读|浏览)"
-        r"(?:一下|下)?(?:这篇|该篇|这个|该|此)?(?:文章|文件|文档|报告|网页)?"
-        r"(?:名为|叫做|名称为)?\s*[:：,，-]?\s*",
-        flags=re.I,
-    )
-
-    previous = None
-    while name and name != previous:
-        previous = name
-        name = prefix_pattern.sub("", name).strip()
-        name = name.strip(" \t\r\n\"'“”‘’《》〈〉【】[]()（）")
-
-    # Remove common trailing request text accidentally captured after the extension.
-    ext_pattern = "|".join(
-        sorted((re.escape(ext) for ext in DOCUMENT_EXTENSIONS), key=len, reverse=True)
-    )
-    m = re.search(rf"(?is)^(.+?(?:{ext_pattern}))(?=$|[》〉】\]）)\s,，。；;:：!?！？])", name)
-    if m:
-        name = m.group(1).strip()
-
-    return Path(name).name.strip() or None
-
-
-def extract_named_filename(user_question):
-    """
-    Extract a specific filename from natural language without using GPT.
-
-    Supported examples:
-    - 请阅读文件《abc.mhtml》，总结主要内容。
-    - 分析“abc.pdf”
-    - 打开 abc.docx 并概括
-    - abc.xlsx
-    """
-    q = (user_question or "").strip()
-    if not q:
-        return None
-
-    ext_pattern = "|".join(
-        sorted((re.escape(ext) for ext in DOCUMENT_EXTENSIONS), key=len, reverse=True)
-    )
-
-    # 1. Highest-confidence form: filename inside Chinese book-title brackets.
-    bracket_patterns = (
-        rf"《\s*([^《》\r\n]+?(?:{ext_pattern}))\s*》",
-        rf"〈\s*([^〈〉\r\n]+?(?:{ext_pattern}))\s*〉",
-        rf"【\s*([^【】\r\n]+?(?:{ext_pattern}))\s*】",
-    )
-    for pattern in bracket_patterns:
-        m = re.search(pattern, q, flags=re.I)
-        if m:
-            return _clean_extracted_filename(m.group(1))
-
-    # 2. Quoted filename.
-    quoted_patterns = (
-        rf'["“]([^"”\r\n]+?(?:{ext_pattern}))["”]',
-        rf"['‘]([^'’\r\n]+?(?:{ext_pattern}))['’]",
-    )
-    for pattern in quoted_patterns:
-        m = re.search(pattern, q, flags=re.I)
-        if m:
-            return _clean_extracted_filename(m.group(1))
-
-    # 3. Unquoted filename. Stop at punctuation or common instruction words after extension.
-    m = re.search(
-        rf"([^\r\n<>《》〈〉【】\"“”'‘’]+?(?:{ext_pattern}))"
-        rf"(?=$|[》〉】\]）)\s,，。；;:：!?！？])",
-        q,
-        flags=re.I,
-    )
-    if m:
-        return _clean_extracted_filename(m.group(1))
-
-    return None
-
-def extract_filename_stem_candidate(user_question):
-    """
-    Extract a likely document title even when the user omits the extension.
-
-    Examples:
-    - 分析《2026年行业发展报告》
-    - 请阅读文件 2026年行业发展报告
-
-    This helper is intentionally conservative and only runs for clear
-    single-document verbs/markers.
-    """
-    q = (user_question or "").strip()
-    if not q:
-        return None
-
-    single_doc_markers = (
-        "阅读", "分析", "总结", "概括", "解读", "查看", "打开",
-        "这篇文章", "该文章", "此文章", "这个文件", "该文件", "此文件",
-        "this article", "this file", "this document", "summarize", "analyze", "read"
-    )
-    qlower = q.lower()
-    if not any(m in qlower for m in single_doc_markers):
-        return None
-
-    # Prefer content inside Chinese/English title brackets or quotes.
-    patterns = (
-        r"《\s*([^《》\r\n]{4,300})\s*》",
-        r"〈\s*([^〈〉\r\n]{4,300})\s*〉",
-        r"【\s*([^【】\r\n]{4,300})\s*】",
-        r'["“]([^"”\r\n]{4,300})["”]',
-        r"['‘]([^'’\r\n]{4,300})['’]",
-    )
-    for pattern in patterns:
-        m = re.search(pattern, q, flags=re.I)
-        if m:
-            candidate = _clean_extracted_filename(m.group(1))
-            return candidate
-
-    # Fallback: remove a leading instruction and common trailing request text.
-    candidate = re.sub(
-        r"^(?:请\s*)?(?:帮我\s*)?(?:阅读|分析|总结|概括|查看|打开|研究|解读|浏览)"
-        r"(?:一下|下)?(?:这篇|该篇|这个|该|此)?(?:文章|文件|文档|报告|网页)?"
-        r"(?:名为|叫做|名称为)?\s*[:：,，-]?\s*",
-        "",
-        q,
-        flags=re.I,
-    ).strip()
-
-    candidate = re.split(
-        r"(?:，|,|。|；|;|\n|\r|\s)+(?:请|并|然后)?(?:总结|分析|概括|说明|给出|列出|介绍|解读)",
-        candidate,
-        maxsplit=1,
-        flags=re.I,
-    )[0].strip()
-
-    candidate = candidate.strip(" \t\r\n\"'“”‘’《》〈〉【】[]()（）")
-    return Path(candidate).name.strip() if len(candidate) >= 4 else None
-
-
-def is_document_followup(user_question):
-    q = (user_question or "").strip().lower()
-    markers = (
-        "此文章", "这篇文章", "该文章", "此文件", "这个文件", "该文件",
-        "此文档", "这个文档", "该文档", "上面文章", "上述文章", "继续",
-        "详细一点", "进一步分析", "分析其内容", "分析此文章内容",
-        "this article", "this file", "this document", "the article", "the file",
-        "continue", "more detail", "analyze it", "summarize it"
-    )
-    return any(x in q for x in markers)
-
-def find_document_by_filename(conn, filename):
-    """
-    Resolve one document from its filename or title.
-
-    Priority:
-    1. Exact FileName match
-    2. Exact filename stem match (extension omitted)
-    3. FileName starts with title
-    4. FileName / FullPath contains title
-
-    The caller must still handle ambiguity instead of silently picking an
-    unrelated document.
-    """
-    if not filename:
-        return []
-
-    base = Path(filename).name.strip()
-    stem = Path(base).stem if Path(base).suffix else base
-
-    sql = """
-    SELECT
-        DocID, FileName, Extension, FullPath, ModifiedTime, ParseStatus,
-        CASE
-            WHEN FileName = %s THEN 0
-            WHEN LOWER(REGEXP_REPLACE(FileName, '\\.[^.]+$', '')) = LOWER(%s) THEN 1
-            WHEN FileName ILIKE %s THEN 2
-            WHEN FileName ILIKE %s THEN 3
-            WHEN FullPath ILIKE %s THEN 4
-            ELSE 9
-        END AS MatchRank
-    FROM Document
-    WHERE FileName = %s
-       OR LOWER(REGEXP_REPLACE(FileName, '\\.[^.]+$', '')) = LOWER(%s)
-       OR FileName ILIKE %s
-       OR FileName ILIKE %s
-       OR FullPath ILIKE %s
-    ORDER BY MatchRank, LENGTH(FileName), ModifiedTime DESC, DocID DESC
-    LIMIT 20;
-    """
-
-    params = (
-        base, stem, f"{stem}.%", f"%{base}%", f"%{base}%",
-        base, stem, f"{stem}.%", f"%{base}%", f"%{base}%",
-    )
-    return execute_select(conn, sql, params, trace_name="FindSingleDocument")
-
-def set_current_document(row):
-    THREAD["current_doc_id"] = row.get("DocID")
-    THREAD["current_file_name"] = row.get("FileName") or ""
-    THREAD["current_full_path"] = row.get("FullPath") or ""
-    THREAD["current_document_mode"] = True
-    THREAD["title"] = row.get("FileName") or THREAD.get("title", "Document")
-    THREAD["docs"] = []
-    THREAD["last_search_query"] = f"DocID={row.get('DocID')}"
-
-def get_document_chunks(conn, doc_id, max_chars=3000, chunk_limit=80):
-    sql = """
-    SELECT
-        c.ChunkID, d.DocID, d.FileName, d.FullPath, d.Extension,
-        d.FolderLevel1, d.FolderLevel2, d.FolderLevel3,
-        c.ChunkNo, c.ChunkSource, c.PageNo, c.SheetName,
-        LEFT(c.ChunkText, %s) AS TextSample,
-        1.0 AS Score
-    FROM DocumentChunk c
-    JOIN Document d ON d.DocID = c.DocID
-    WHERE c.DocID = %s
-    ORDER BY c.ChunkNo, c.ChunkID
-    LIMIT %s;
-    """
-    return execute_select(conn, sql, (max_chars, doc_id, chunk_limit), trace_name="SingleDocumentChunks")
-
-def count_document_chunks(conn, doc_id):
-    row = execute_select(
-        conn,
-        "SELECT COUNT(*) AS ChunkCount FROM DocumentChunk WHERE DocID=%s",
-        (doc_id,), fetch="one", trace_name="CountSingleDocumentChunks"
-    )
-    return int((row or {}).get("ChunkCount") or 0)
-
-def build_single_document_doc(conn, doc_id):
-    chunk_limit = get_int_setting(conn, "MaxSingleDocumentChunks", 80)
-    max_chars = get_int_setting(conn, "MaxSingleDocumentChunkChars", 3000)
-    chunks = get_document_chunks(conn, doc_id, max_chars=max_chars, chunk_limit=chunk_limit)
-    if not chunks:
-        return None
-    first = chunks[0]
-    return {
-        "DocID": first["DocID"], "FileName": first["FileName"], "FullPath": first["FullPath"],
-        "Extension": first["Extension"], "FolderLevel1": first.get("FolderLevel1"),
-        "FolderLevel2": first.get("FolderLevel2"), "FolderLevel3": first.get("FolderLevel3"),
-        "BestScore": 1.0, "Top3AverageScore": 1.0, "RankingScore": 1.0, "Chunks": chunks,
-    }
-
-def run_single_document(conn, user_question, explicit_filename=None):
-    set_execution_mode("SINGLE_DOCUMENT_SQL", "GPT_RAG")
-    row = None
-    if explicit_filename:
-        matches = find_document_by_filename(conn, explicit_filename)
-        if not matches:
-            print(f"没有找到文件：{explicit_filename}")
-            if CURRENT_EXECUTION is not None:
-                CURRENT_EXECUTION["ExecutionStatus"] = "NoResults"
-                CURRENT_EXECUTION["SearchQuery"] = explicit_filename
-                CURRENT_EXECUTION["NewSearch"] = True
-            return True
-
-        best_rank = int(matches[0].get("MatchRank") or 0)
-        best_matches = [m for m in matches if int(m.get("MatchRank") or 0) == best_rank]
-
-        # Never silently choose between multiple equally good title matches.
-        if len(best_matches) > 1:
-            print(f"找到多个同名或近似文件，无法安全确定唯一文档：{explicit_filename}")
-            for m in best_matches[:10]:
-                print(f"- DocID={m.get('DocID')} | {m.get('FileName')} | {m.get('FullPath')}")
-            if CURRENT_EXECUTION is not None:
-                CURRENT_EXECUTION["ExecutionStatus"] = "Ambiguous"
-                CURRENT_EXECUTION["SearchQuery"] = explicit_filename
-                CURRENT_EXECUTION["NewSearch"] = True
-                CURRENT_EXECUTION["RetrievalStats"] = {
-                    "CandidateDocuments": len(best_matches),
-                    "FilenameResolution": "AMBIGUOUS",
-                }
-            return True
-
-        row = best_matches[0]
-        set_current_document(row)
-    elif THREAD.get("current_document_mode") and THREAD.get("current_doc_id"):
-        row = {
-            "DocID": THREAD["current_doc_id"],
-            "FileName": THREAD.get("current_file_name"),
-            "FullPath": THREAD.get("current_full_path"),
-        }
-    else:
-        return False
-
-    total_document_chunks = count_document_chunks(conn, row["DocID"])
-    doc = build_single_document_doc(conn, row["DocID"])
-    if not doc:
-        print(f"文件已定位，但没有找到可用正文 Chunk：{row.get('FileName')}")
-        return True
-
-    THREAD["docs"] = [doc]
-    stats = {
-        "MatchedChunks": len(doc["Chunks"]), "ChunkLimit": len(doc["Chunks"]),
-        "ChunksRetrieved": len(doc["Chunks"]), "UniqueDocumentsMatched": 1,
-        "TopKDocuments": 1, "DocumentsSent": 1,
-        "DocumentRankingMethod": "FIXED_DOC_ID",
-        "CurrentDocID": row["DocID"], "CurrentFileName": row.get("FileName"),
-        "TotalDocumentChunks": total_document_chunks,
-        "DocumentChunksSent": len(doc["Chunks"]),
-    }
-    THREAD["retrieval_stats"] = stats
-    if CURRENT_EXECUTION is not None:
-        CURRENT_EXECUTION["RouterIntent"] = "SINGLE_DOCUMENT_ANALYSIS"
-        CURRENT_EXECUTION["SearchMode"] = "SINGLE_DOCUMENT_SQL"
-        CURRENT_EXECUTION["PresentationMode"] = "GPT_RAG"
-        CURRENT_EXECUTION["SearchQuery"] = f"DocID={row['DocID']}"
-        CURRENT_EXECUTION["NewSearch"] = True if explicit_filename else False
-        CURRENT_EXECUTION["RetrievalStats"] = dict(stats)
-
-    print("\nSearch Mode: SINGLE_DOCUMENT_SQL")
-    print(f"Current document: {row.get('FileName')} | DocID={row.get('DocID')}")
-    print(f"Chunks loaded: {len(doc['Chunks'])} / total {total_document_chunks}")
-    if len(doc["Chunks"]) < total_document_chunks:
-        print("Note: document input was capped by MaxSingleDocumentChunks.")
-    print("Thinking...\n")
-
-    result = answer_with_gpt(user_question, [doc], "RAG_ANSWER")
-    answer = result["text"]
-    print("=" * 100)
-    print(answer)
-    print("=" * 100)
-    THREAD["history"].append({"question": user_question, "answer": answer})
-    update_thread_summary(user_question, answer)
-    log_question(conn, user_question, f"DocID={row['DocID']}", answer, [doc], 0,
-                 intent="SINGLE_DOCUMENT_ANALYSIS", searched=True, retrieval_stats=stats,
-                 llm_usage=result, prompt_chars=result.get("prompt_chars"),
-                 max_chunks_per_doc=min(len(doc["Chunks"]), 20), max_chars_per_chunk=3000)
-    return True
 
 
 # =====================================================
@@ -2470,7 +2114,18 @@ def retrieve_docs(conn, user_question, force_new_search=False, rag_scope_mode="A
             hints=hints,
         )
         matched_chunks = len(chunks)
-        context_chunks_per_doc = 20
+        # Allocate one generic context budget across the resolved document scope.
+        # A scope containing one file can use the whole budget; broader scopes
+        # divide it across documents without introducing a separate file mode.
+        direct_context_budget = max(
+            1,
+            get_int_setting(conn, "DirectScopeContextChunkBudget", 80),
+        )
+        resolved_document_count = max(int(scoped_documents or 1), 1)
+        context_chunks_per_doc = max(
+            1,
+            direct_context_budget // resolved_document_count,
+        )
         ranking_method = "HARD_METADATA_DIRECT_SCOPED_CHUNKS"
     else:
         matched_chunks = count_matching_chunks(
@@ -2633,7 +2288,7 @@ When an explicit task override is present, follow it as the requested operation.
 It is an instruction only; do not treat it as retrieved evidence.
 
 Retrieved document context:
-{build_docs_context(docs, max_chunks_per_doc=(len(docs[0]["Chunks"]) if len(docs)==1 and THREAD.get("current_document_mode") else int((THREAD.get("retrieval_stats") or {}).get("ContextChunksPerDoc") or 3)))}
+{build_docs_context(docs, max_chunks_per_doc=int((THREAD.get("retrieval_stats") or {}).get("ContextChunksPerDoc") or 3))}
 """
 
     result = gpt_call([
@@ -2701,9 +2356,7 @@ def log_question(
     )
 
     CURRENT_EXECUTION["RouterIntent"] = intent or CURRENT_EXECUTION.get("RouterIntent")
-    if intent == "SINGLE_DOCUMENT_ANALYSIS":
-        CURRENT_EXECUTION["SearchMode"] = "SINGLE_DOCUMENT_SQL"
-    elif not CURRENT_EXECUTION.get("SearchMode"):
+    if not CURRENT_EXECUTION.get("SearchMode"):
         scope_mode = (retrieval_stats or {}).get("RAGScopeMode")
         CURRENT_EXECUTION["SearchMode"] = (
             f"RAG_{scope_mode}_FULLTEXT" if scope_mode else "RAG_FULLTEXT"
@@ -2911,10 +2564,6 @@ def reset_thread():
         "docs": [],
         "last_search_query": "",
         "retrieval_stats": {},
-        "current_doc_id": None,
-        "current_file_name": "",
-        "current_full_path": "",
-        "current_document_mode": False,
         "last_rag_scope": {},
         "last_rag_scope_mode": "AUTO",
         "last_semantic_query": "",
@@ -2926,9 +2575,6 @@ def show_thread():
     print("\nThread ID:", THREAD["id"])
     print("Title:", THREAD["title"])
     print("Last search:", THREAD["last_search_query"])
-    print("Current document mode:", THREAD.get("current_document_mode"))
-    print("Current DocID:", THREAD.get("current_doc_id"))
-    print("Current file:", THREAD.get("current_file_name") or "(none)")
     print("Last RAG scope mode:", THREAD.get("last_rag_scope_mode") or "(none)")
     print("Last RAG scope:", json.dumps(THREAD.get("last_rag_scope") or {}, ensure_ascii=False))
     print("Last semantic query:", THREAD.get("last_semantic_query") or "(none)")
@@ -3426,15 +3072,11 @@ def process_user_question(conn, user_question):
         THREAD["docs"] = []
         THREAD["last_search_query"] = ""
         THREAD["retrieval_stats"] = {}
-        THREAD["current_doc_id"] = None
-        THREAD["current_file_name"] = ""
-        THREAD["current_full_path"] = ""
-        THREAD["current_document_mode"] = False
         THREAD["last_rag_scope"] = {}
         THREAD["last_rag_scope_mode"] = "AUTO"
         THREAD["last_semantic_query"] = ""
         THREAD["last_query_hints"] = {}
-        print("Cleared retrieval cache, RAG scope state and current-document binding. Conversation history was kept.")
+        print("Cleared retrieval cache and RAG scope state. Conversation history was kept.")
         return
 
     if qlower == "/thread":
@@ -3628,19 +3270,6 @@ def process_user_question(conn, user_question):
             )
             return
 
-
-    explicit_filename = extract_named_filename(user_question)
-    if not explicit_filename:
-        explicit_filename = extract_filename_stem_candidate(user_question)
-
-    if explicit_filename:
-        if run_single_document(conn, user_question, explicit_filename=explicit_filename):
-            return
-
-    if THREAD.get("current_document_mode") and is_document_followup(user_question):
-        if run_single_document(conn, user_question):
-            return
-
     route = route_question(user_question)
     intent = route["intent"]
 
@@ -3660,22 +3289,6 @@ def process_user_question(conn, user_question):
     if intent == "THREAD_STATUS":
         set_execution_mode("COMMAND", "CONSOLE_TEXT")
         show_thread()
-        return
-
-    if intent == "SINGLE_DOCUMENT_ANALYSIS":
-        # Strict rule: a single-document intent must never fall back to full-text RAG.
-        candidate = extract_named_filename(user_question) or extract_filename_stem_candidate(user_question)
-        if candidate:
-            run_single_document(conn, user_question, explicit_filename=candidate)
-            return
-        if run_single_document(conn, user_question):
-            return
-
-        print("已识别为单文档分析，但当前没有可绑定的唯一文件。请在问题中写明文件名。")
-        if CURRENT_EXECUTION is not None:
-            CURRENT_EXECUTION["ExecutionStatus"] = "NoDocumentBound"
-            CURRENT_EXECUTION["SearchMode"] = "SINGLE_DOCUMENT_SQL"
-            CURRENT_EXECUTION["PresentationMode"] = "CONSOLE_TEXT"
         return
 
     if run_metadata(conn, user_question, intent, route, hints=hints):
